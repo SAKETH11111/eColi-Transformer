@@ -1,0 +1,29 @@
+# data
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# notebooks
+.ipynb_checkpoints/
+
+# python artefacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# checkpoints & logs
+checkpoints/
+wandb/
+
+# env / IDE
+.env
+.env.*
+.idea/
+.vscode/
+
+# misc
+*.pt
+*.egg-info/
+.DS_Store
