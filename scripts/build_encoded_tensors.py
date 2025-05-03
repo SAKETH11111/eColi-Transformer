@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""
+Builds encoded tensors from FASTA files using CodonTokenizer.
+
+Reads sequences from a FASTA file, tokenizes them into codons and codon pairs,
+extracts CAI from the header, calculates Minimum Free Energy (MFE) using RNAfold,
+and saves the results as a dictionary of PyTorch tensors.
+
+Uses multiprocessing to speed up the process, especially the RNAfold calls.
+"""
+
+import argparse
+from pathlib import Path
+import sys
+import os
+import re
+import subprocess
+import torch
+from typing import Dict, List, Optional, Tuple
+import numpy as np # For NaN handling
+import time # For progress updates
+import concurrent.futures # For parallel processing
+from functools import partial # To pass tokenizer to helper function
+
+# Add project root to Python path
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
+
+# Import from the tokenizer module
+try:
+    from ecoli_transformer.tokenizer import CodonTokenizer
+except ImportError as e:
+    print(f"Error importing tokenizer module: {e}")
+    print(f"Ensure ecoli_transformer/tokenizer.py exists and Python path is correct: {sys.path}")
+    sys.exit(1)
+
+FASTA_HEADER_PATTERN = re.compile(r">(?P<gene_id>[^|]+)(?:\|len=(?P<length>\d+))?(?:\|cai=(?P<cai>[\d\.]+))?(?:\|gc=(?P<gc>[\d\.]+))?")
+RNAFOLD_MFE_PATTERN = re.compile(r".*\( *(-?\d+\.\d+) *\)") # Extracts MFE value in parentheses
+
+def parse_fasta(filepath: Path) -> List[Tuple[str, str, Dict[str, Optional[str]]]]:
+    """Parses a FASTA file, returning sequence ID, sequence, and header metadata."""
+    sequences = []
+    current_seq = ""
+    seq_id = None
+    metadata = {}
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                # Save previous sequence
+                if seq_id is not None and current_seq:
+                    sequences.append((seq_id, current_seq, metadata))
+
+                # Start new sequence
+                current_seq = ""
+                match = FASTA_HEADER_PATTERN.match(line)
+                if match:
+                    metadata = match.groupdict()
+                    seq_id = metadata.get('gene_id')
+                else:
+                    # Fallback if pattern doesn't match
+                    seq_id = line[1:].split()[0] # Get first part after '>'
+                    metadata = {'gene_id': seq_id}
+                    print(f"Warning: Could not parse header fully for: {line}. Using ID: {seq_id}")
+
+            elif seq_id is not None: # Only add sequence lines if we have a valid header
+                current_seq += line.upper().replace(' ', '') # Ensure uppercase and no spaces
+
+        # Add the last sequence
+        if seq_id is not None and current_seq:
+            sequences.append((seq_id, current_seq, metadata))
+
+    return sequences
+
+def run_rnafold(sequence: str) -> Optional[float]:
+    """Runs RNAfold on a sequence and returns the Minimum Free Energy (MFE)."""
+    if not sequence:
+        return None
+    try:
+        # Use 'RNAfold --noPS' to avoid generating the PostScript file
+        # Input sequence via stdin, capture stdout/stderr
+        process = subprocess.run(
+            ['RNAfold', '--noPS'],
+            input=sequence,
+            text=True,
+            capture_output=True,
+            check=True, # Raise an exception if RNAfold fails
+            timeout=60 # Add a timeout (e.g., 60 seconds)
+        )
+
+        # Output is typically:
+        # Sequence
+        # Structure ( MFE)
+        output_lines = process.stdout.strip().split('\n')
+        if len(output_lines) >= 2:
+            match = RNAFOLD_MFE_PATTERN.match(output_lines[1])
+            if match:
+                return float(match.group(1))
+            else:
+                # Suppress warning spam, log only occasionally if needed
+                # print(f"Warning: Could not parse MFE from RNAfold output line: {output_lines[1]}")
+                pass
+        else:
+            # Suppress warning spam
+            # print(f"Warning: Unexpected RNAfold output format for sequence (len {len(sequence)}). Output:\n{process.stdout}")
+            pass
+
+    except FileNotFoundError:
+        # This error should only happen once, so we exit
+        print("Error: 'RNAfold' command not found. Please ensure ViennaRNA package is installed and in PATH.")
+        sys.exit(1)
+    except subprocess.CalledProcessError:
+        # Suppress warning spam
+        # print(f"Error running RNAfold for sequence (len {len(sequence)}): {e}")
+        # print(f"RNAfold stderr: {e.stderr}")
+        pass
+    except subprocess.TimeoutExpired:
+        # Suppress warning spam
+        # print(f"Error: RNAfold timed out for sequence (len {len(sequence)}).")
+        pass
+    except Exception as e:
+        # Suppress warning spam
+        # print(f"An unexpected error occurred during RNAfold execution: {e}")
+        pass
+
+    return None # Return None if MFE couldn't be obtained
+
+
+def process_sequence(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer) -> Optional[Dict]:
+    """
+    Helper function to process a single sequence entry.
+    Tokenizes, extracts CAI, runs RNAfold, and returns a dictionary of results.
+    Returns None if processing fails significantly (e.g., zero length).
+    """
+    seq_id, sequence, metadata = sequence_data
+
+    # 1. Tokenize
+    try:
+        token_ids_list, pair_ids_list = tokenizer.encode_cds(sequence)
+        codon_length = len(token_ids_list) - 2 # Exclude CLS and SEP
+    except Exception as e:
+        print(f"Error tokenizing sequence {seq_id}: {e}")
+        return None
+
+    # Skip if tokenization failed badly
+    if codon_length <= 0:
+        # print(f"Warning: Skipping sequence {seq_id} due to zero codon length after tokenization.")
+        return None
+
+    # 2. Extract CAI
+    cai_str = metadata.get('cai')
+    cai: float = np.nan # Default to NaN
+    if cai_str:
+        try:
+            cai = float(cai_str)
+        except (ValueError, TypeError):
+            # print(f"Warning: Could not parse CAI value '{cai_str}' for sequence {seq_id}. Using NaN.")
+            pass # Keep NaN
+    # else:
+        # print(f"Warning: CAI value missing in header for sequence {seq_id}. Using NaN.")
+        # pass # Keep NaN
+
+    # 3. Run RNAfold for MFE
+    mfe = run_rnafold(sequence)
+    if mfe is None:
+        mfe = np.nan # Use NaN if MFE calculation fails
+
+    return {
+        'gene_id': seq_id,
+        'token_ids': torch.LongTensor(token_ids_list),
+        'pair_ids': torch.LongTensor(pair_ids_list),
+        'cai': cai,
+        'mfe': mfe,
+        'length': codon_length
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build encoded PyTorch tensors from FASTA files.")
+    parser.add_argument("--fasta", type=str, required=True,
+                        help="Input FASTA file path (e.g., data/processed/train.fasta).")
+    parser.add_argument("--out", type=str, required=True,
+                        help="Output PyTorch tensor file path (e.g., data/processed/train.pt).")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Process only the first N sequences (for testing).")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of worker processes (defaults to number of CPUs).")
+    args = parser.parse_args()
+
+    fasta_path = Path(args.fasta)
+    out_path = Path(args.out)
+    limit = args.limit
+    num_workers = args.workers
+
+    if not fasta_path.is_file():
+        print(f"Error: Input FASTA file not found: {fasta_path}")
+        sys.exit(1)
+
+    # Ensure output directory exists
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize tokenizer *before* the process pool
+    tokenizer = CodonTokenizer()
+
+    print(f"Parsing FASTA file: {fasta_path}...")
+    sequences = parse_fasta(fasta_path)
+    num_sequences_total = len(sequences)
+    print(f"Found {num_sequences_total} sequences.")
+
+    if limit is not None:
+        sequences = sequences[:limit]
+        print(f"Processing limit applied: {limit} sequences.")
+
+    num_sequences_to_process = len(sequences)
+    if num_sequences_to_process == 0:
+        print("No sequences to process. Exiting.")
+        sys.exit(0)
+
+    print(f"Encoding sequences and calculating MFE using {num_workers or 'all available'} CPU cores...")
+    start_time = time.time()
+
+    all_results: List[Optional[Dict]] = []
+    # Create a partial function to pass the tokenizer instance to the worker process
+    process_func = partial(process_sequence, tokenizer=tokenizer)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Use executor.map to process sequences in parallel
+        # results will be an iterator yielding the return value of process_sequence for each item
+        results_iterator = executor.map(process_func, sequences)
+
+        # Process results as they become available (optional: for progress)
+        processed_count = 0
+        last_print_time = start_time
+        for result in results_iterator:
+            all_results.append(result)
+            processed_count += 1
+            current_time = time.time()
+            # Print progress every 5 seconds or for the last item
+            if current_time - last_print_time > 5 or processed_count == num_sequences_to_process:
+                 elapsed_time = current_time - start_time
+                 avg_time_per_seq = elapsed_time / processed_count if processed_count > 0 else 0
+                 print(f"  Processed {processed_count}/{num_sequences_to_process} sequences... ({avg_time_per_seq:.3f} s/seq)")
+                 last_print_time = current_time
+
+    # Filter out None results (sequences that failed processing)
+    valid_results = [r for r in all_results if r is not None]
+    num_failed = num_sequences_to_process - len(valid_results)
+
+    if num_failed > 0:
+        print(f"Warning: Failed to process {num_failed}/{num_sequences_to_process} sequences.")
+
+    if not valid_results:
+         print("Error: No sequences were successfully processed.")
+         sys.exit(1)
+
+    # Assemble the final data dictionary from valid results
+    data_dict = {
+        'gene_id': [r['gene_id'] for r in valid_results],
+        'token_ids': [r['token_ids'] for r in valid_results],
+        'pair_ids': [r['pair_ids'] for r in valid_results],
+        'cai': torch.FloatTensor([r['cai'] for r in valid_results]),
+        'mfe': torch.FloatTensor([r['mfe'] for r in valid_results]),
+        'length': torch.LongTensor([r['length'] for r in valid_results])
+    }
+
+    total_time = time.time() - start_time
+    print(f"Finished processing in {total_time:.2f} seconds.")
+
+    print(f"Saving encoded data to: {out_path}...")
+    try:
+        torch.save(data_dict, out_path)
+    except Exception as e:
+        print(f"Error saving data to {out_path}: {e}")
+        sys.exit(1)
+
+    avg_len = data_dict['length'].float().mean().item() if len(data_dict['length']) > 0 else 0
+    print(f"✔️  Encoded {len(valid_results)} sequences | avg len {avg_len:.0f} codons | saved {out_path}")
+
+
+if __name__ == "__main__":
+    main() 
