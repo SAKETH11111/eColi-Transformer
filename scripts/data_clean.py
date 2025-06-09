@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Cleans raw E. coli sequence data, filters based on quality rules,
 deduplicates sequences, performs a stratified split, and saves
@@ -14,11 +13,9 @@ import numpy as np
 import hashlib
 from sklearn.model_selection import train_test_split
 
-# Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
-# Import from the dataio module
 try:
     from ecoli_transformer.dataio import load_raw_dir, basic_stats, _calculate_gc_content, _has_internal_stop
 except ImportError as e:
@@ -26,7 +23,6 @@ except ImportError as e:
     print(f"Ensure ecoli_transformer/dataio.py exists and Python path is correct: {sys.path}")
     sys.exit(1)
 
-# --- Sequence Validation Functions ---
 def check_start_codon(cds):
     """Checks if CDS starts with 'ATG'."""
     return isinstance(cds, str) and cds.startswith('ATG')
@@ -61,7 +57,7 @@ def write_fasta(df, filename, header_cols=['gene_id', 'length', 'cai', 'gc_perce
             if 'gene_id' in header_cols and pd.notna(row['gene_id']):
                 header_parts.append(f"{row['gene_id']}")
             else:
-                 header_parts.append(f"seq_{_}") # Fallback ID if gene_id is missing
+                 header_parts.append(f"seq_{_}")
 
             if 'length' in header_cols and pd.notna(row['length']):
                 header_parts.append(f"len={row['length']}")
@@ -74,7 +70,6 @@ def write_fasta(df, filename, header_cols=['gene_id', 'length', 'cai', 'gc_perce
             sequence = row['cds']
             f.write(f"{header}\n{sequence}\n")
 
-# --- Main Cleaning Logic ---
 def main():
     parser = argparse.ArgumentParser(description="Clean and split E. coli sequence data.")
     parser.add_argument("--input_dir", type=str, required=True,
@@ -99,10 +94,8 @@ def main():
         print("Error: Validation and test fractions must be between 0 and 1, and their sum must be less than 1.")
         sys.exit(1)
 
-    # Create output directory if it doesn't exist
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load Data
     print(f"Loading raw data from: {input_path.resolve()}")
     df_raw = load_raw_dir(input_path)
     if df_raw.empty:
@@ -110,14 +103,11 @@ def main():
         sys.exit(1)
     print(f"Loaded {len(df_raw)} rows.")
 
-    # 2. Filter
     print("Applying filters...")
-    # Drop rows with missing CAI
     df_filtered = df_raw.dropna(subset=['cai']).copy()
     print(f"  {len(df_raw) - len(df_filtered)} rows dropped due to missing CAI.")
     rows_before_cds_filter = len(df_filtered)
 
-    # Apply sequence validity checks
     valid_mask = df_filtered['cds'].apply(is_valid_cds)
     df_filtered = df_filtered[valid_mask].copy()
     rows_dropped_cds = rows_before_cds_filter - len(df_filtered)
@@ -127,10 +117,8 @@ def main():
          print("Error: No valid sequences remained after filtering.")
          sys.exit(1)
 
-    # 3. Deduplicate
     print("Deduplicating sequences...")
     df_filtered['md5'] = df_filtered['cds'].apply(calculate_md5)
-    # Sort by CAI (desc) to keep the best CAI score for duplicate sequences
     df_deduped = df_filtered.sort_values('cai', ascending=False).drop_duplicates('md5', keep='first').copy()
     rows_dropped_dups = len(df_filtered) - len(df_deduped)
     print(f"  {rows_dropped_dups} duplicate CDS rows dropped (keeping highest CAI).")
@@ -138,25 +126,20 @@ def main():
     rows_after_clean = len(df_deduped)
     print(f"Total rows after cleaning and deduplication: {rows_after_clean}")
 
-    # Check if enough rows remain
     if rows_after_clean < 10000:
         print(f"Error: Only {rows_after_clean} rows remain after cleaning, which is less than the threshold of 10,000.")
         sys.exit(1)
 
-    # Calculate additional stats needed for output
     df_deduped['length'] = df_deduped['cds'].str.len()
     df_deduped['gc_percent'] = df_deduped['cds'].apply(lambda x: _calculate_gc_content(x) if pd.notna(x) else None)
 
-    # Re-calculate basic stats on the cleaned data for validation printout
-    stats_clean = basic_stats(df_deduped) # Note: basic_stats recalculates some things, but useful for validation format
+    stats_clean = basic_stats(df_deduped)
 
-    # 4. Stratified split
     print(f"Performing stratified split (Val: {val_frac:.0%}, Test: {test_frac:.0%}, Seed: {seed})...")
     df_deduped['len_quartile'] = pd.qcut(df_deduped['length'], 4, labels=False, duplicates='drop')
     df_deduped['cai_quartile'] = pd.qcut(df_deduped['cai'], 4, labels=False, duplicates='drop')
     df_deduped['stratum'] = df_deduped['len_quartile'].astype(str) + '_' + df_deduped['cai_quartile'].astype(str)
 
-    # Split off test set first
     train_val_idx, test_idx = train_test_split(
         df_deduped.index,
         test_size=test_frac,
@@ -165,13 +148,11 @@ def main():
         stratify=df_deduped['stratum']
     )
 
-    # Split remaining into train and validation
-    # Adjust val_frac relative to the remaining data
     relative_val_frac = val_frac / (1.0 - test_frac)
     train_idx, val_idx = train_test_split(
         train_val_idx,
         test_size=relative_val_frac,
-        random_state=seed, # Use the same seed for reproducibility
+        random_state=seed,
         shuffle=True,
         stratify=df_deduped.loc[train_val_idx, 'stratum']
     )
@@ -184,20 +165,16 @@ def main():
     print(f"  Validation set size: {len(df_val)}")
     print(f"  Test set size: {len(df_test)}")
 
-    # 5. Write outputs
     print(f"Writing output files to: {output_path.resolve()}")
 
-    # Clean CDS FASTA
     fasta_all_path = output_path / "clean_cds.fasta"
-    write_fasta(df_deduped, fasta_all_path, header_cols=['gene_id']) # Only gene_id for this file
+    write_fasta(df_deduped, fasta_all_path, header_cols=['gene_id'])
     print(f"  Saved all cleaned sequences to {fasta_all_path.name}")
 
-    # Genes CSV
     genes_csv_path = output_path / "genes.csv"
     df_deduped[['gene_id', 'cds', 'cai', 'length', 'gc_percent']].to_csv(genes_csv_path, index=False)
     print(f"  Saved gene info to {genes_csv_path.name}")
 
-    # Split FASTAs
     fasta_train_path = output_path / "train.fasta"
     fasta_val_path = output_path / "val.fasta"
     fasta_test_path = output_path / "test.fasta"
@@ -207,14 +184,12 @@ def main():
     write_fasta(df_test, fasta_test_path)
     print(f"  Saved split FASTAs: {fasta_train_path.name}, {fasta_val_path.name}, {fasta_test_path.name}")
 
-    # 6. Validation printout
     print("Validation Summary:")
     print("After clean & dedupe:")
     print(f"  rows         : {stats_clean.get('rows', 0):,}")
-    # After deduplication and filtering, these should be 0 by definition
-    print(f"  duplicates   : 0") # Calculated md5 duplicates before drop_duplicates, now should be 0
-    print(f"  start/stop   : 0") # Filtered out
-    print(f"  internal stop: 0") # Filtered out
+    print(f"  duplicates   : 0")
+    print(f"  start/stop   : 0")
+    print(f"  internal stop: 0")
 
     print(f"Split summary (seed={seed}):")
     total_split = len(df_train) + len(df_val) + len(df_test)
@@ -225,7 +200,6 @@ def main():
     print(f"  val   : {val_pct:.0%}  → n={len(df_val):,}")
     print(f"  test  : {test_pct:.0%}  → n={len(df_test):,}")
 
-    # Use stats calculated on the final df_deduped
     gc_mean = df_deduped['gc_percent'].mean()
     gc_std = df_deduped['gc_percent'].std()
     len_median = df_deduped['length'].median()
