@@ -13,10 +13,10 @@ from pathlib import Path
 import sys
 import os
 import re
-import subprocess
 import torch
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+import RNA
 import time
 import concurrent.futures
 from functools import partial
@@ -68,40 +68,15 @@ def parse_fasta(filepath: Path) -> List[Tuple[str, str, Dict[str, Optional[str]]
     return sequences
 
 def run_rnafold(sequence: str) -> Optional[float]:
-    """Runs RNAfold on a sequence and returns the Minimum Free Energy (MFE)."""
+    """Calculates MFE using the ViennaRNA Python binding."""
     if not sequence:
         return None
     try:
-        process = subprocess.run(
-            ['RNAfold', '--noPS'],
-            input=sequence,
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=60
-        )
-
-        output_lines = process.stdout.strip().split('\n')
-        if len(output_lines) >= 2:
-            match = RNAFOLD_MFE_PATTERN.match(output_lines[1])
-            if match:
-                return float(match.group(1))
-            else:
-                pass
-        else:
-            pass
-
-    except FileNotFoundError:
-        print("Error: 'RNAfold' command not found. Please ensure ViennaRNA package is installed and in PATH.")
-        sys.exit(1)
-    except subprocess.CalledProcessError:
-        pass
-    except subprocess.TimeoutExpired:
-        pass
-    except Exception as e:
-        pass
-
-    return None
+        # RNA.fold returns a tuple: (structure, mfe)
+        _, mfe = RNA.fold(sequence)
+        return mfe
+    except Exception:
+        return None
 
 def process_sequence(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer) -> Optional[Dict]:
     """
@@ -237,4 +212,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
