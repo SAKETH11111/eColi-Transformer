@@ -1,6 +1,11 @@
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple
+from typing import List
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
 from ecoli_transformer.tokenizer import CodonTokenizer, RESTRICTION_SITES
@@ -12,78 +17,129 @@ def has_restriction_site(sequence: str, sites: dict = RESTRICTION_SITES) -> bool
             return True
     return False
 
-def generate_optimized_sequence(protein_seq: str, model: CodonEncoder, tokenizer: CodonTokenizer, device: torch.device, deterministic: bool = True, top_p: float = 0.9) -> str:
-    """
-    Generates an optimized DNA sequence from a protein sequence using a bidirectional, masked language modeling approach.
-    """
-    model.eval()
+class STREAMDecoder:
+    def __init__(self, model_path: str, device: str = 'cpu', deterministic: bool = True):
+        self.device = torch.device(device)
+        self.tokenizer = CodonTokenizer()
+        self.model = self.load_model(model_path)
+        self.model.eval()
+        self.deterministic = deterministic
 
-    # 1. Convert protein sequence to masked amino acid tokens
-    masked_input = [f"{aa}_UNK" for aa in protein_seq]
-    
-    # 2. Add special tokens and encode
-    # This is a simplified encoding; a real implementation might have organism-specific tokens
-    encoded_input = [tokenizer.cls_id] + [tokenizer.codon_to_id[t] for t in masked_input] + [tokenizer.sep_id]
-    input_ids = torch.LongTensor([encoded_input]).to(device)
+    def load_model(self, model_path: str) -> CodonEncoder:
+        """Loads a trained CodonEncoder model."""
+        model = CodonEncoder(vocab_size=self.tokenizer.vocab_size)
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except FileNotFoundError:
+            print(f"Error: Model checkpoint not found at {model_path}")
+            raise
+        except Exception as e:
+            print(f"Error loading model state_dict: {e}")
+            raise
+        return model.to(self.device)
 
-    # 3. Get model predictions for all positions simultaneously
-    with torch.no_grad():
-        logits, _, _, _ = model(input_ids)
+    def get_synonymous_codon_ids(self, aa_unk_token: str) -> List[int]:
+        """Gets the token IDs for all synonymous codons for a given AA_UNK token."""
+        synonymous_tokens = self.tokenizer.get_synonymous_tokens(aa_unk_token)
+        return self.tokenizer.encode(synonymous_tokens)
 
-    # 4. Decode the sequence
-    if deterministic:
-        # Greedy decoding
-        predicted_ids = torch.argmax(logits, dim=-1).squeeze(0)
-    else:
-        # Nucleus sampling
-        probs = F.softmax(logits, dim=-1).squeeze(0)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    def nucleus_sample(self, logits: torch.Tensor, valid_ids: List[int], p=0.9) -> int:
+        """Performs nucleus sampling on a given set of logits, restricted to valid IDs."""
+        # This is a simplified implementation. A robust one would handle edge cases better.
+        filtered_logits = torch.full((self.tokenizer.vocab_size,), -float('Inf'), device=self.device)
+        filtered_logits[valid_ids] = logits[valid_ids]
+        
+        probabilities = F.softmax(filtered_logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+        
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
         
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
+        # Find indices to remove
+        sorted_indices_to_remove = cumulative_probs > p
+        sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+        sorted_indices_to_remove[0] = 0
         
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-        probs[indices_to_remove] = 0
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        probabilities[indices_to_remove] = 0
+        probabilities /= probabilities.sum()
         
-        predicted_ids = torch.multinomial(probs, 1).squeeze(-1)
+        return torch.multinomial(probabilities, 1).item()
 
-    # 5. Convert IDs to sequence and apply constraints
-    # We only care about the codon predictions, not the special tokens
-    predicted_codons = [tokenizer.id_to_codon[id_.item()] for id_ in predicted_ids[1:-1]]
-    optimized_sequence = "".join(predicted_codons)
+    def apply_constraints(self, sequence: str) -> str:
+        """Placeholder for applying biological constraints like avoiding restriction sites."""
+        if has_restriction_site(sequence):
+            # In a real implementation, we might try to repair this.
+            # For now, we just flag it.
+            print(f"Warning: Generated sequence contains restriction site(s).")
+        return sequence
 
-    # Post-processing filter (simple version)
-    if has_restriction_site(optimized_sequence):
-        print("Warning: Generated sequence contains restriction sites. Returning original sequence.")
-        return "".join(tokenizer.decode(input_ids.squeeze(0)[1:-1]))
+    def generate_optimized_sequence(self, protein_seq: str, organism_id: int = 0) -> str:
+        """
+        Generate optimized DNA using true bidirectional MLM prediction.
+        """
+        # 1. Convert protein to AA_UNK tokens
+        aa_unk_tokens = self.tokenizer.protein_to_aa_unk_tokens(protein_seq)
+        input_tokens = ['[CLS]'] + aa_unk_tokens + ['[SEP]']
+        
+        # 2. Encode and add organism context
+        input_ids = torch.tensor([self.tokenizer.encode(input_tokens)], device=self.device)
+        organism_ids = torch.tensor([organism_id], device=self.device)
+        
+        # 3. Single forward pass - bidirectional prediction
+        with torch.no_grad():
+            logits, _, _, _ = self.model(input_ids, organism_ids=organism_ids)
+        
+        # 4. Predict best codon for each position simultaneously
+        predicted_tokens = []
+        for i, token in enumerate(aa_unk_tokens):
+            position_logits = logits[0, i + 1, :]  # +1 for CLS token
+            
+            valid_codon_ids = self.get_synonymous_codon_ids(token)
+            if not valid_codon_ids:
+                # Fallback to a generic codon if something goes wrong
+                predicted_tokens.append(self.tokenizer.id_to_token[self.tokenizer.mask_id])
+                continue
 
-    return optimized_sequence
+            if self.deterministic:
+                # Create a tensor of -inf and fill in the valid logits
+                filtered_logits = torch.full_like(position_logits, -float('Inf'))
+                filtered_logits[valid_codon_ids] = position_logits[valid_codon_ids]
+                best_id = torch.argmax(filtered_logits).item()
+                predicted_tokens.append(self.tokenizer.id_to_token[best_id])
+            else:
+                predicted_id = self.nucleus_sample(position_logits, valid_codon_ids)
+                predicted_tokens.append(self.tokenizer.id_to_token[predicted_id])
+        
+        # 5. Decode and apply biological constraints
+        final_sequence = self.tokenizer.decode_to_str(self.tokenizer.encode(predicted_tokens))
+        
+        return self.apply_constraints(final_sequence)
 
-# --- Smoke Test ---
 if __name__ == '__main__':
-    # This is a placeholder for a real protein sequence
-    example_protein_sequence = "MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSHGSAQVKGHGKKVADALTNAVAHVDDMPNALSALSDLHAHKLRVDPVNFKLLSHCLLVTLAAHLPAEFTPAVHASLDKFLASVSTVLTSKYR"
-    
-    print("Running STREAM-style decoder smoke test...")
+    # This is a placeholder for a proper test, assuming a trained STREAM model exists.
+    # You would run this after completing the training step.
+    print("Running STREAMDecoder smoke test...")
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Create a dummy model file for testing purposes
+        # In a real scenario, this would be your trained model checkpoint
+        dummy_model_path = "dummy_stream_model.pt"
         tokenizer = CodonTokenizer()
         model = CodonEncoder(vocab_size=tokenizer.vocab_size)
-        checkpoint = torch.load("checkpoints/multitask_long.pt", map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-        
-        optimized_sequence = generate_optimized_sequence(example_protein_sequence, model, tokenizer, device)
-        
-        print("\n--- Original Protein Sequence ---")
-        print(example_protein_sequence)
-        print("\n--- Generated DNA Sequence ---")
-        print(optimized_sequence)
-        print("\n✅ STREAM-style decoder smoke test complete.")
+        torch.save({'model_state_dict': model.state_dict()}, dummy_model_path)
 
-    except FileNotFoundError:
-        print("\n❌ Smoke test failed: Checkpoint 'checkpoints/multitask_long.pt' not found.")
+        decoder = STREAMDecoder(dummy_model_path, deterministic=True)
+        protein = "MKT"
+        result = decoder.generate_optimized_sequence(protein)
+        print(f"Protein: {protein}")
+        print(f"Optimized DNA: {result}")
+        assert len(result) == len(protein) * 3
+        print("\n✅ STREAMDecoder self-test complete.")
+        
+        # Clean up the dummy file
+        os.remove(dummy_model_path)
+
     except Exception as e:
-        print(f"\n❌ Smoke test failed with an error: {e}")
+        print(f"\n❌ STREAMDecoder test failed: {e}")
+        if 'dummy_model_path' in locals() and os.path.exists(dummy_model_path):
+            os.remove(dummy_model_path)

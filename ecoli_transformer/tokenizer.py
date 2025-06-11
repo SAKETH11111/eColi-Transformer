@@ -2,38 +2,13 @@ import itertools
 import random
 from typing import List, Tuple, Dict
 
+# --- Foundational Vocabulary Components ---
 BASES = ['A', 'T', 'G', 'C']
-CODON_LIST = [''.join(p) for p in itertools.product(BASES, repeat=3)]
 AMINO_ACIDS = 'ACDEFGHIKLMNPQRSTVWY'
-UNK_AA_TOKENS = [f"{aa}_UNK" for aa in AMINO_ACIDS]
+STOP_CODON = '*'
 
-SPECIALS = ['[PAD]', '[MASK]', '[CLS]', '[SEP]']
-
-VOCAB = SPECIALS + CODON_LIST + UNK_AA_TOKENS
-VOCAB_SIZE = len(VOCAB)
-
-CODON_TO_ID: Dict[str, int] = {token: i for i, token in enumerate(VOCAB)}
-ID_TO_CODON: Dict[int, str] = {i: token for i, token in enumerate(VOCAB)}
-
-CODON_PAIR_INDEX: Dict[Tuple[str, str], int] = {
-    pair: i for i, pair in enumerate(itertools.product(CODON_LIST, repeat=2))
-}
-PAIR_VOCAB_SIZE = len(CODON_PAIR_INDEX)
-
-PAD_ID = CODON_TO_ID['[PAD]']
-MASK_ID = CODON_TO_ID['[MASK]']
-CLS_ID = CODON_TO_ID['[CLS]']
-SEP_ID = CODON_TO_ID['[SEP]']
-
-RESTRICTION_SITES = {
-    "EcoRI": "GAATTC",
-    "HindIII": "AAGCTT",
-    "BamHI": "GGATCC",
-    "BglII": "AGATCT",
-    "XhoI": "CTCGAG",
-}
-
-AA_TO_CODONS = {
+# --- Genetic Code and Codon Mappings ---
+AA_TO_CODONS: Dict[str, List[str]] = {
     'A': ['GCT', 'GCC', 'GCA', 'GCG'], 'C': ['TGT', 'TGC'], 'D': ['GAT', 'GAC'],
     'E': ['GAA', 'GAG'], 'F': ['TTT', 'TTC'], 'G': ['GGT', 'GGC', 'GGA', 'GGG'],
     'H': ['CAT', 'CAC'], 'I': ['ATT', 'ATC', 'ATA'], 'K': ['AAA', 'AAG'],
@@ -41,127 +16,132 @@ AA_TO_CODONS = {
     'N': ['AAT', 'AAC'], 'P': ['CCT', 'CCC', 'CCA', 'CCG'], 'Q': ['CAA', 'CAG'],
     'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'], 'S': ['TCT', 'TCC', 'TCA', 'TCG', 'AGT', 'AGC'],
     'T': ['ACT', 'ACC', 'ACA', 'ACG'], 'V': ['GTT', 'GTC', 'GTA', 'GTG'],
-    'W': ['TGG'], 'Y': ['TAT', 'TAC'], '*': ['TAA', 'TAG', 'TGA']
+    'W': ['TGG'], 'Y': ['TAT', 'TAC'], STOP_CODON: ['TAA', 'TAG', 'TGA']
+}
+CODON_TO_AA: Dict[str, str] = {codon: aa for aa, codons in AA_TO_CODONS.items() for codon in codons}
+CODON_LIST: List[str] = list(CODON_TO_AA.keys())
+
+# --- STREAM-Specific Vocabulary ---
+SPECIALS = ['[PAD]', '[MASK]', '[CLS]', '[SEP]']
+AA_UNK_TOKENS = [f"{aa}_UNK" for aa in AMINO_ACIDS]
+AA_CODON_TOKENS = [f"{CODON_TO_AA[codon]}_{codon}" for codon in CODON_LIST]
+
+# --- Final Vocabulary Assembly ---
+VOCAB = SPECIALS + CODON_LIST + AA_UNK_TOKENS + AA_CODON_TOKENS
+VOCAB_SIZE = len(VOCAB)
+
+# --- ID Mappings ---
+TOKEN_TO_ID: Dict[str, int] = {token: i for i, token in enumerate(VOCAB)}
+ID_TO_TOKEN: Dict[int, str] = {i: token for i, token in enumerate(VOCAB)}
+
+PAD_ID = TOKEN_TO_ID['[PAD]']
+MASK_ID = TOKEN_TO_ID['[MASK]']
+CLS_ID = TOKEN_TO_ID['[CLS]']
+SEP_ID = TOKEN_TO_ID['[SEP]']
+
+# --- Other Constants ---
+RESTRICTION_SITES = {
+    "EcoRI": "GAATTC", "HindIII": "AAGCTT", "BamHI": "GGATCC",
+    "BglII": "AGATCT", "XhoI": "CTCGAG",
 }
 
 class CodonTokenizer:
     """
-    Tokenizes nucleotide sequences into codons and codon pairs.
-    Includes special tokens [PAD], [MASK], [CLS], [SEP].
-    Provides masking functionality based on Absci's contextual rule (BERT-like).
+    Tokenizer for the STREAM (CodonTransformer) architecture.
+    Handles a vocabulary of codons, special tokens, AA-UNK tokens, and AA-codon tokens.
     """
     def __init__(self):
-        self.codon_to_id = CODON_TO_ID
-        self.id_to_codon = ID_TO_CODON
-        self.codon_pair_index = CODON_PAIR_INDEX
+        self.token_to_id = TOKEN_TO_ID
+        self.id_to_token = ID_TO_TOKEN
         self.vocab = VOCAB
         self.vocab_size = VOCAB_SIZE
-        self.pair_vocab_size = PAIR_VOCAB_SIZE
         self.pad_id = PAD_ID
         self.mask_id = MASK_ID
         self.cls_id = CLS_ID
         self.sep_id = SEP_ID
-        self.codon_ids = [self.codon_to_id[c] for c in CODON_LIST]
 
-    def _split_into_codons(self, cds: str) -> List[str]:
-        """Splits a CDS string into a list of codons."""
-        if len(cds) % 3 != 0:
-            print(f"Warning: CDS length {len(cds)} is not divisible by 3. Truncating.")
-            cds = cds[:len(cds) - (len(cds) % 3)]
-        return [cds[i:i+3] for i in range(0, len(cds), 3)]
+    def encode(self, tokens: List[str]) -> List[int]:
+        """Encodes a list of tokens into their corresponding IDs."""
+        return [self.token_to_id.get(t, self.mask_id) for t in tokens]
 
-    def encode_cds(self, cds: str) -> Tuple[List[int], List[int]]:
-        """
-        Encodes a CDS string into token IDs and codon pair IDs.
-        Adds [CLS] at the beginning and [SEP] at the end of token IDs.
-        Pair IDs correspond to adjacent codon pairs in the original sequence.
-        """
-        codons = self._split_into_codons(cds)
-        if not codons:
-            return [self.cls_id, self.sep_id], []
-
-        token_ids = [self.cls_id] + [self.codon_to_id.get(c, self.mask_id) for c in codons] + [self.sep_id]
-
-        pair_ids = []
-        for i in range(len(codons) - 1):
-            pair = (codons[i], codons[i+1])
-            pair_idx = self.codon_pair_index.get(pair)
-            if pair_idx is not None:
-                pair_ids.append(pair_idx)
-            else:
-                 print(f"Warning: Codon pair {pair} not found in index. Skipping.")
-
-
-        return token_ids, pair_ids
-
-    def decode(self, token_ids: List[int]) -> str:
-        """Decodes a list of token IDs back into a string (codons joined)."""
-        codons = [self.id_to_codon[id_] for id_ in token_ids if id_ not in [self.cls_id, self.sep_id, self.pad_id]]
+    def decode_to_str(self, token_ids: List[int]) -> str:
+        """Decodes a list of token IDs back into a DNA sequence string."""
+        codons = []
+        for id_ in token_ids:
+            if id_ in self.id_to_token:
+                token = self.id_to_token[id_]
+                if '_' in token:
+                    # Handles 'A_GCA' -> 'GCA'
+                    codon = token.split('_')[1]
+                    if len(codon) == 3 and all(c in BASES for c in codon):
+                        codons.append(codon)
+                elif len(token) == 3 and all(c in BASES for c in token):
+                     # Handles raw codon tokens like 'ATG'
+                    codons.append(token)
         return "".join(codons)
 
-    def is_stop_codon(self, codon: str) -> bool:
-        """Checks if a codon is a stop codon."""
-        return codon in ['TAA', 'TAG', 'TGA']
-
-    def mask(self, token_ids: List[int], mask_prob=0.15, random_prob=0.1, keep_prob=0.1) -> Tuple[List[int], List[int]]:
+    def protein_to_aa_unk_tokens(self, protein_seq: str) -> List[str]:
         """
-        Applies BERT-style masking to token IDs.
-        Based on "Absci contextual rule" (assumed BERT-like).
-        Selects mask_prob fraction of tokens (excluding CLS, SEP, PAD).
-        80% of selected -> [MASK]
-        10% of selected -> random codon
-        10% of selected -> original token
-
-        Returns:
-            Tuple[List[int], List[int]]: Masked token IDs and original labels
-                                         (original token ID or PAD_ID if not masked).
+        Convert protein sequence to amino acid UNK tokens.
+        'MALW' -> ['M_UNK', 'A_UNK', 'L_UNK', 'W_UNK']
         """
-        masked_token_ids = list(token_ids)
-        labels = [self.pad_id] * len(token_ids)
+        return [f"{aa}_UNK" for aa in protein_seq]
 
-        eligible_indices = [
-            i for i, token_id in enumerate(token_ids)
-            if token_id not in [self.cls_id, self.sep_id, self.pad_id]
-        ]
+    def get_synonymous_tokens(self, aa_unk_token: str) -> List[str]:
+        """
+        Get all possible codon-specific tokens for an amino acid UNK token.
+        'A_UNK' -> ['A_GCA', 'A_GCC', 'A_GCG', 'A_GCT']
+        """
+        aa = aa_unk_token.split('_')[0]
+        if aa in AA_TO_CODONS:
+            return [f"{aa}_{codon}" for codon in AA_TO_CODONS[aa]]
+        return []
 
-        num_to_mask = int(len(eligible_indices) * mask_prob)
-        if num_to_mask == 0:
-            return masked_token_ids, labels
+    def validate_protein_translation(self, token_sequence: List[str], protein_sequence: str) -> bool:
+        """
+        Ensure the predicted sequence of AA_CODON tokens translates to the correct protein.
+        """
+        if len(token_sequence) != len(protein_sequence):
+            return False
+        
+        for i, token in enumerate(token_sequence):
+            expected_aa = protein_sequence[i]
+            if not token.startswith(f"{expected_aa}_"):
+                return False
+        return True
 
-        indices_to_mask = sorted(random.sample(eligible_indices, num_to_mask))
-
-        for i in indices_to_mask:
-            labels[i] = masked_token_ids[i]
-
-            rand_val = random.random()
-            if rand_val < (1.0 - random_prob - keep_prob):
-                masked_token_ids[i] = self.mask_id
-            elif rand_val < (1.0 - keep_prob):
-                masked_token_ids[i] = random.choice(self.codon_ids)
-            else:
-                pass
-
-        return masked_token_ids, labels
+    def cds_to_aa_codon_tokens(self, cds: str) -> List[str]:
+        """Converts a CDS string into a list of amino acid-codon tokens."""
+        codons = [cds[i:i+3] for i in range(0, len(cds), 3) if len(cds[i:i+3]) == 3]
+        aa_codon_tokens = []
+        for codon in codons:
+            aa = CODON_TO_AA.get(codon)
+            if aa:
+                if aa == STOP_CODON:
+                    break
+                aa_codon_tokens.append(f"{aa}_{codon}")
+        return aa_codon_tokens
 
 if __name__ == '__main__':
     tokenizer = CodonTokenizer()
-    print(f"Vocab size: {tokenizer.vocab_size}")
-    print(f"Codon pair vocab size: {tokenizer.pair_vocab_size}")
-    print(f"CLS ID: {tokenizer.cls_id}, SEP ID: {tokenizer.sep_id}, PAD ID: {tokenizer.pad_id}, MASK ID: {tokenizer.mask_id}")
+    print(f"STREAM Vocab Size: {tokenizer.vocab_size}")
+    assert tokenizer.vocab_size == 4 + 64 + 20 + 64
 
-    cds_example = "ATGCGTTAACGTAAG"
-    token_ids, pair_ids = tokenizer.encode_cds(cds_example)
-    print(f"\nCDS: {cds_example}")
-    print(f"Token IDs: {token_ids}")
-    print(f"Pair IDs: {pair_ids}")
-    print(f"Decoded: {tokenizer.decode(token_ids)}")
+    protein = "MKT"
+    unk_tokens = tokenizer.protein_to_aa_unk_tokens(protein)
+    print(f"\nProtein '{protein}' -> UNK tokens: {unk_tokens}")
+    assert unk_tokens == ['M_UNK', 'K_UNK', 'T_UNK']
 
-    masked_ids, labels = tokenizer.mask(token_ids)
-    print(f"Masked IDs: {masked_ids}")
-    print(f"Labels:     {labels}")
+    synonymous = tokenizer.get_synonymous_tokens('A_UNK')
+    print(f"\nSynonymous tokens for 'A_UNK': {synonymous}")
+    assert synonymous == ['A_GCT', 'A_GCC', 'A_GCA', 'A_GCG']
 
-    cds_short = "ATG"
-    token_ids_short, pair_ids_short = tokenizer.encode_cds(cds_short)
-    print(f"\nCDS Short: {cds_short}")
-    print(f"Token IDs: {token_ids_short}")
-    print(f"Pair IDs: {pair_ids_short}")
+    valid_translation = tokenizer.validate_protein_translation(['M_ATG', 'K_AAA', 'T_ACC'], 'MKT')
+    print(f"\nTranslation validation (correct): {valid_translation}")
+    assert valid_translation
+
+    invalid_translation = tokenizer.validate_protein_translation(['M_ATG', 'A_GCT', 'T_ACC'], 'MKT')
+    print(f"Translation validation (incorrect): {invalid_translation}")
+    assert not invalid_translation
+    
+    print("\n✅ Tokenizer self-tests passed.")

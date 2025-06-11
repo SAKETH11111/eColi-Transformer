@@ -17,6 +17,9 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
+from ecoli_transformer.tokenizer import CodonTokenizer
+
+PAD_ID = CodonTokenizer().pad_id
 
 class GeneDataset(Dataset):
     def __init__(self, pt_file, tiny=False):
@@ -26,69 +29,35 @@ class GeneDataset(Dataset):
             print("Using --tiny flag: loading only first 500 sequences.")
             data = {k: v[:500] for k, v in data.items()}
 
-        self.token_ids = data['token_ids']
-        self.pair_ids = data['pair_ids']
+        self.input_ids = data['input_ids']
+        self.labels = data['labels']
+        self.organism_ids = data['organism_id']
         self.cai = data['cai']
         self.mfe = data['mfe']
-        
-        self.pad_token_id = 0
-        self.mask_token_id = 65
-        self.cls_token_id = 66
-        self.sep_token_id = 67
-        self.codon_vocab_size = 64
 
     def __len__(self):
-        return len(self.token_ids)
+        return len(self.input_ids)
 
     def __getitem__(self, idx):
-        token_ids = self.token_ids[idx]
-        pair_ids = self.pair_ids[idx]
-        cai = self.cai[idx]
-        mfe = self.mfe[idx]
-
-        input_ids, mlm_labels = self.dynamic_mask(token_ids)
-
         return {
-            "input_ids": input_ids,
-            "pair_ids": pair_ids,
-            "mlm_labels": mlm_labels,
-            "cai": cai,
-            "dg": mfe
+            "input_ids": self.input_ids[idx],
+            "labels": self.labels[idx],
+            "organism_id": self.organism_ids[idx],
+            "cai": self.cai[idx],
+            "dg": self.mfe[idx]
         }
 
-    def dynamic_mask(self, token_ids):
-        labels = token_ids.clone()
-        
-        prob_matrix = torch.full(labels.shape, 0.15)
-        
-        special_tokens_mask = (token_ids == self.cls_token_id) | \
-                              (token_ids == self.sep_token_id) | \
-                              (token_ids == self.pad_token_id)
-        prob_matrix.masked_fill_(special_tokens_mask, value=0.0)
-        
-        masked_indices = torch.bernoulli(prob_matrix).bool()
-        labels[~masked_indices] = -100
-
-        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-        token_ids[indices_replaced] = self.mask_token_id
-
-        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-        random_words = torch.randint(0, self.codon_vocab_size, labels.shape, dtype=torch.long)
-        token_ids[indices_random] = random_words[indices_random]
-
-        return token_ids, labels
-
 def collate_fn(batch):
-    input_ids = pad_sequence([item['input_ids'] for item in batch], batch_first=True, padding_value=0)
-    pair_ids = pad_sequence([item['pair_ids'] for item in batch], batch_first=True, padding_value=0)
-    mlm_labels = pad_sequence([item['mlm_labels'] for item in batch], batch_first=True, padding_value=-100)
+    input_ids = pad_sequence([item['input_ids'] for item in batch], batch_first=True, padding_value=PAD_ID)
+    labels = pad_sequence([item['labels'] for item in batch], batch_first=True, padding_value=-100)
     
-    attention_mask = (input_ids != 0).float()
+    attention_mask = (input_ids != PAD_ID).float()
     
+    organism_ids = torch.tensor([item['organism_id'] for item in batch], dtype=torch.long)
     cai = torch.tensor([item['cai'] for item in batch], dtype=torch.float)
     dg = torch.tensor([item['dg'] for item in batch], dtype=torch.float)
 
-    return input_ids, pair_ids, attention_mask, mlm_labels, cai, dg
+    return input_ids, organism_ids, attention_mask, labels, cai, dg
 
 def main():
     parser = argparse.ArgumentParser(description="Train eColi Transformer Model")
@@ -117,6 +86,7 @@ def main():
     
     Path(args.save).parent.mkdir(parents=True, exist_ok=True)
 
+    tokenizer = CodonTokenizer()
     train_dataset = GeneDataset(args.train_pt, tiny=args.tiny)
     val_dataset = GeneDataset(args.val_pt, tiny=args.tiny)
 
@@ -131,7 +101,8 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
-    model = CodonEncoder().to(device)
+    tokenizer = CodonTokenizer()
+    model = CodonEncoder(vocab_size=tokenizer.vocab_size).to(device)
 
     if args.load_checkpoint and Path(args.load_checkpoint).exists():
         print(f"Loading model weights from checkpoint: {args.load_checkpoint}")
@@ -141,8 +112,6 @@ def main():
     if args.freeze_encoder:
         print("Freezing encoder layers. Only training regression heads.")
         for param in model.token_embedding.parameters():
-            param.requires_grad = False
-        for param in model.pair_embedding.parameters():
             param.requires_grad = False
         for param in model.transformer_encoder.parameters():
             param.requires_grad = False
@@ -186,16 +155,15 @@ def main():
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
         for i, batch in enumerate(progress_bar):
-            batch = [t.to(device) for t in batch]
-            input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
+            input_ids, organism_ids, attention_mask, labels, cai_target, dg_target = [t.to(device) for t in batch]
 
             with torch.amp.autocast('cuda'):
                 mlm_logits, loss, _, _ = model(
-                    input_ids=input_ids, 
-                    pair_ids=pair_ids, 
+                    input_ids=input_ids,
+                    organism_ids=organism_ids,
                     attention_mask=attention_mask,
-                    mlm_labels=mlm_labels, 
-                    cai_target=cai_target, 
+                    mlm_labels=labels,
+                    cai_target=cai_target,
                     dg_target=dg_target,
                     cai_weight=args.cai_weight,
                     dg_weight=args.dg_weight
@@ -236,15 +204,14 @@ def main():
 
         with torch.no_grad():
             for batch in val_loader:
-                batch = [t.to(device) for t in batch]
-                input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
+                input_ids, organism_ids, attention_mask, labels, cai_target, dg_target = [t.to(device) for t in batch]
                 
                 with torch.amp.autocast('cuda'):
-                    mlm_logits, _, cai_pred, dg_pred = model(input_ids, pair_ids, attention_mask)
+                    mlm_logits, _, cai_pred, dg_pred = model(input_ids, organism_ids=organism_ids, attention_mask=attention_mask)
 
-                masked_tokens = mlm_labels != -100
+                masked_tokens = labels != -100
                 all_mlm_preds.append(mlm_logits[masked_tokens].argmax(dim=-1))
-                all_mlm_labels.append(mlm_labels[masked_tokens])
+                all_mlm_labels.append(labels[masked_tokens])
 
                 all_cai_preds.append(cai_pred.squeeze())
                 all_cai_targets.append(cai_target)
