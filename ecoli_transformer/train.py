@@ -115,6 +115,8 @@ def main():
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to load a checkpoint from, without resuming optimizer state")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
     parser.add_argument("--freeze_encoder", action="store_true", help="Freeze the transformer encoder layers")
+    parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of warmup steps for the scheduler")
+    parser.add_argument("--lr_scheduler", type=str, default="linear", choices=["linear", "cosine"], help="LR scheduler type")
     args = parser.parse_args()
 
     if args.tiny:
@@ -164,19 +166,21 @@ def main():
         optimizer = AdamW(model.parameters(), lr=args.lr)
     
     num_training_steps = args.epochs * len(train_loader)
-    num_warmup_steps = int(0.1 * num_training_steps)
     
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        return max(
-            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
-        )
-
-    scheduler = LambdaLR(optimizer, lr_lambda)
+    if args.lr_scheduler == 'cosine':
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps - args.warmup_steps)
+    else: # linear
+        def lr_lambda(current_step):
+            if current_step < args.warmup_steps:
+                return float(current_step) / float(max(1, args.warmup_steps))
+            return max(
+                0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - args.warmup_steps))
+            )
+        scheduler = LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler('cuda')
 
-    best_val_mlm_acc = -1
+    best_composite_score = -float('inf')
     epochs_no_improve = 0
     start_epoch = 0
 
@@ -185,8 +189,10 @@ def main():
         print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # Only load optimizer and scheduler if not freezing encoder
+        if not args.freeze_encoder:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_mlm_acc = checkpoint.get('best_val_mlm_acc', -1)
 
@@ -278,16 +284,23 @@ def main():
 
         print(f"Epoch {epoch}: train_loss {total_train_loss / len(train_loader):.2f} | val_MLM_acc {val_mlm_acc:.2f} | val_CAI_R2 {val_cai_r2:.2f} | val_dG_RMSE {val_dg_rmse:.2f}")
 
-        if val_mlm_acc > best_val_mlm_acc:
-            best_val_mlm_acc = val_mlm_acc
+        # --- Composite Score Checkpointing ---
+        # Normalize dG_RMSE by a reasonable maximum to balance its contribution
+        max_dg_rmse = 50.0 
+        composite_score = val_mlm_acc + val_cai_r2 - (val_dg_rmse / max_dg_rmse)
+
+        print(f"Epoch {epoch}: train_loss {total_train_loss / len(train_loader):.2f} | val_MLM_acc {val_mlm_acc:.2f} | val_CAI_R2 {val_cai_r2:.2f} | val_dG_RMSE {val_dg_rmse:.2f} | Composite_Score {composite_score:.2f}")
+
+        if composite_score > best_composite_score:
+            best_composite_score = composite_score
             epochs_no_improve = 0
-            print(f"Saved checkpoint: {args.save}")
+            print(f"Saved checkpoint: {args.save} (Score: {best_composite_score:.2f})")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_mlm_acc': best_val_mlm_acc,
+                'best_composite_score': best_composite_score,
             }, args.save)
         else:
             epochs_no_improve += 1
