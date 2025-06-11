@@ -111,6 +111,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--save", type=str, default="checkpoints/baseline.pt", help="Path to save best checkpoint")
+    parser.add_argument("--cai_weight", type=float, default=0.2, help="Weight for CAI loss")
+    parser.add_argument("--dg_weight", type=float, default=0.2, help="Weight for dG loss")
     parser.add_argument("--tiny", action="store_true", help="Train on a tiny subset for testing")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
@@ -127,6 +129,16 @@ def main():
     # --- Data ---
     train_dataset = GeneDataset(args.train_pt, tiny=args.tiny)
     val_dataset = GeneDataset(args.val_pt, tiny=args.tiny)
+
+    # --- Normalization ---
+    cai_mean, cai_std = train_dataset.cai.mean(), train_dataset.cai.std()
+    mfe_mean, mfe_std = train_dataset.mfe.mean(), train_dataset.mfe.std()
+    
+    train_dataset.cai = (train_dataset.cai - cai_mean) / cai_std
+    train_dataset.mfe = (train_dataset.mfe - mfe_mean) / mfe_std
+    val_dataset.cai = (val_dataset.cai - cai_mean) / cai_std
+    val_dataset.mfe = (val_dataset.mfe - mfe_mean) / mfe_std
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
@@ -171,13 +183,15 @@ def main():
             input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
 
             with torch.amp.autocast('cuda'):
-                mlm_logits, loss = model(
+                mlm_logits, loss, _, _ = model(
                     input_ids=input_ids, 
                     pair_ids=pair_ids, 
                     attention_mask=attention_mask,
                     mlm_labels=mlm_labels, 
                     cai_target=cai_target, 
-                    dg_target=dg_target
+                    dg_target=dg_target,
+                    cai_weight=args.cai_weight,
+                    dg_weight=args.dg_weight
                 )
             
             scaler.scale(loss).backward()
@@ -209,9 +223,7 @@ def main():
                 input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
                 
                 with torch.amp.autocast('cuda'):
-                    mlm_logits, _ = model(input_ids, pair_ids, attention_mask)
-                    cai_pred = model.cai_head(model.transformer_encoder(model.token_embedding(input_ids) + model.positional_encoding[:, :input_ids.size(1), :], src_key_padding_mask=attention_mask).mean(dim=1))
-                    dg_pred = model.dg_head(model.transformer_encoder(model.token_embedding(input_ids) + model.positional_encoding[:, :input_ids.size(1), :], src_key_padding_mask=attention_mask).mean(dim=1))
+                    mlm_logits, _, cai_pred, dg_pred = model(input_ids, pair_ids, attention_mask)
 
                 # MLM Accuracy
                 masked_tokens = mlm_labels != -100

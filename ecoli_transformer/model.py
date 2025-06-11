@@ -24,7 +24,7 @@ class CodonEncoder(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, input_ids, pair_ids=None, attention_mask=None, mlm_labels=None, cai_target=None, dg_target=None):
+    def forward(self, input_ids, pair_ids=None, attention_mask=None, mlm_labels=None, cai_target=None, dg_target=None, cai_weight=0.2, dg_weight=0.2):
         x = self.token_embedding(input_ids)
         if pair_ids is not None:
             # Pad pair_ids to match input_ids length
@@ -46,11 +46,11 @@ class CodonEncoder(nn.Module):
             if mlm_labels is not None:
                 mlm_loss = nn.CrossEntropyLoss(ignore_index=-100)(mlm_logits.view(-1, mlm_logits.size(-1)), mlm_labels.view(-1))
                 loss += mlm_loss
-            if cai_target is not None:
+            if cai_target is not None and cai_weight > 0:
                 cai_loss = nn.MSELoss()(cai_pred.squeeze(), cai_target)
-                loss += 0.2 * cai_loss
-            if dg_target is not None:
+                loss += cai_weight * cai_loss
+            if dg_target is not None and dg_weight > 0:
                 dg_loss = nn.MSELoss()(dg_pred.squeeze(), dg_target)
-                loss += 0.2 * dg_loss
+                loss += dg_weight * dg_loss
 
-        return mlm_logits, loss
+        return mlm_logits, loss, cai_pred, dg_pred

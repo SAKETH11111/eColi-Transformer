@@ -86,8 +86,11 @@ def main():
         # Validate shapes and dtypes
         print("\n--- Tensor Shapes and Dtypes ---")
         for key, value in data.items():
-            if isinstance(value, list): # For token_ids and pair_ids
-                print(f"  - {key}: List of {len(value)} tensors, e.g., shape={value[0].shape}, dtype={value[0].dtype}")
+            if isinstance(value, list):
+                if len(value) > 0 and hasattr(value[0], 'shape'):
+                    print(f"  - {key}: List of {len(value)} tensors, e.g., shape={value[0].shape}, dtype={value[0].dtype}")
+                else:
+                    print(f"  - {key}: List of {len(value)} items, e.g., type={type(value[0])}")
             else:
                 print(f"  - {key}: shape={value.shape}, dtype={value.dtype}")
 
