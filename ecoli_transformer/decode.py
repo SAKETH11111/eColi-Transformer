@@ -5,21 +5,11 @@ from typing import List, Tuple
 import sys
 from pathlib import Path
 
-# Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
-from ecoli_transformer.tokenizer import CodonTokenizer
-
-# --- Biological Constraints ---
-RESTRICTION_SITES = {
-    "EcoRI": "GAATTC",
-    "HindIII": "AAGCTT",
-    "BamHI": "GGATCC",
-    "BglII": "AGATCT",
-    "XhoI": "CTCGAG",
-}
+from ecoli_transformer.tokenizer import CodonTokenizer, RESTRICTION_SITES
 
 def has_restriction_site(sequence: str, sites: dict = RESTRICTION_SITES) -> bool:
     """Checks if a sequence contains any of the given restriction sites."""
@@ -28,7 +18,6 @@ def has_restriction_site(sequence: str, sites: dict = RESTRICTION_SITES) -> bool
             return True
     return False
 
-# --- Beam Search Decoder ---
 class BeamSearchDecoder:
     def __init__(self, model: CodonEncoder, tokenizer: CodonTokenizer, device: torch.device):
         self.model = model
@@ -36,12 +25,14 @@ class BeamSearchDecoder:
         self.device = device
         self.model.eval()
 
-    def generate(self, start_sequence: str, beam_size: int = 5, max_len: int = 512, dg_penalty: float = 0.1):
+    def generate(self, start_sequence: str, beam_size: int = 10, max_len: int = 512, dg_penalty: float = 1.0):
         """
         Generates optimized sequences using beam search.
         """
         start_tokens = self.tokenizer.encode_cds(start_sequence)[0]
-        start_node = (0.0, start_tokens, self.tokenizer.decode(start_tokens[1:-1])) # (score, tokens, sequence_str)
+        start_tokens[1] = self.tokenizer.codon_to_id['ATG']
+        
+        start_node = (0.0, start_tokens, self.tokenizer.decode(start_tokens[1:-1]))
         
         live_beams = [start_node]
         finished_beams = []
@@ -52,7 +43,7 @@ class BeamSearchDecoder:
 
             new_beams = []
             for score, tokens, seq_str in live_beams:
-                if tokens[-1] == self.tokenizer.sep_token_id:
+                if tokens[-1] == self.tokenizer.sep_id:
                     finished_beams.append((score, tokens, seq_str))
                     continue
 
@@ -64,8 +55,6 @@ class BeamSearchDecoder:
                 # --- Scoring ---
                 log_probs = F.log_softmax(mlm_logits[:, -1, :], dim=-1)
                 
-                # Add dG penalty (we want to maximize dG, so penalize low values)
-                # The model predicts dG, so a higher value is better (less negative)
                 score_update = dg_penalty * torch.sigmoid(dg_pred.mean())
                 
                 top_k = torch.topk(log_probs, beam_size, dim=-1)
@@ -77,7 +66,6 @@ class BeamSearchDecoder:
                     new_tokens = tokens + [next_token]
                     new_seq_str = self.tokenizer.decode(new_tokens[1:-1])
 
-                    # --- Constraint Checking ---
                     if has_restriction_site(new_seq_str):
                         continue
                     
@@ -88,11 +76,11 @@ class BeamSearchDecoder:
 
         finished_beams.extend(live_beams)
         
-        # Return top N beams, ensuring they end with a stop codon
         final_candidates = []
         for score, tokens, seq_str in sorted(finished_beams, key=lambda x: x[0], reverse=True):
-            if self.tokenizer.is_stop_codon(self.tokenizer.id_to_token[tokens[-1]]):
-                 final_candidates.append((seq_str, score))
+            final_tokens = tokens[:-1] + [self.tokenizer.codon_to_id['TAA']]
+            final_seq_str = self.tokenizer.decode(final_tokens[1:-1])
+            final_candidates.append((final_seq_str, score))
         
         return final_candidates[:beam_size]
 
@@ -104,7 +92,7 @@ def generate_optimized(sequence: str, model_path: str, beam_size: int = 5) -> Li
     
     # Load model
     model = CodonEncoder()
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     
@@ -116,16 +104,12 @@ def generate_optimized(sequence: str, model_path: str, beam_size: int = 5) -> Li
     
     return optimized_sequences
 
-# --- Smoke Test ---
 if __name__ == '__main__':
-    # This is a placeholder for a real sequence from your validation set
-    # In a real scenario, you would load this from a FASTA file
     example_sequence = "ATGGTGAGCAAGGGCGAGGAGCTGTTCACCGGGGTGGTGCCCATCCTGGTCGAGCTGGACGGCGACGTAAACGGCCACAAGTTCAGCGTGTCCGGCGAGGGCGAGGGCGATGCCACCTACGGCAAGCTGACCCTGAAGTTCATCTGCACCACCGGCAAGCTGCCCGTGCCCTGGCCCACCCTCGTGACCACCCTGACCTACGGCGTGCAGTGCTTCAGCCGCTACCCCGACCACATGAAGCAGCACGACTTCTTCAAGTCCGCCATGCCCGAAGGCTACGTCCAGGAGCGCACCATCTTCTTCAAGGACGACGGCAACTACAAGACCCGCGCCGAGGTGAAGTTCGAGGGCGACACCCTGGTGAACCGCATCGAGCTGAAGGGCATCGACTTCAAGGAGGACGGCAACATCCTGGGGCACAAGCTGGAGTACAACTACAACAGCCACAACGTCTATATCATGGCCGACAAGCAGAAGAACGGCATCAAGGTGAACTTCAAGATCCGCCACAACATCGAGGACGGCAGCGTGCAGCTCGCCGACCACTACCAGCAGAACACCCCCATCGGCGACGGCCCCGTGCTGCTGCCCGACAACCACTACCTGAGCACCCAGTCCGCCCTGAGCAAAGACCCCAACGAGAAGCGCGATCACATGGTCCTGCTGGAGTTCGTGACCGCCGCCGGGATCACTCTCGGCATGGACGAGCTGTACAAGTAA"
     
     print("Running smoke test...")
     try:
-        # You must have a trained model checkpoint to run this
-        optimized_variants = generate_optimized(example_sequence, model_path="checkpoints/multitask_long.pt", beam_size=3)
+        optimized_variants = generate_optimized(example_sequence, model_path="checkpoints/multitask_long.pt", beam_size=10)
         
         if optimized_variants:
             print("\n--- Generated Variants ---")

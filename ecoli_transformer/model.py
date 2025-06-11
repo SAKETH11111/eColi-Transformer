@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 class CodonEncoder(nn.Module):
-    def __init__(self, vocab_size=68, pair_vocab_size=4096, hidden_dim=512, nhead=8, num_layers=6, dim_feedforward=2048, max_seq_len=4096):
+    def __init__(self, vocab_size, pair_vocab_size=4096, hidden_dim=512, nhead=8, num_layers=6, dim_feedforward=2048, max_seq_len=4096):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.pair_embedding = nn.Embedding(pair_vocab_size, hidden_dim)
@@ -27,7 +27,6 @@ class CodonEncoder(nn.Module):
     def forward(self, input_ids, pair_ids=None, attention_mask=None, mlm_labels=None, cai_target=None, dg_target=None, cai_weight=0.2, dg_weight=0.2):
         x = self.token_embedding(input_ids)
         if pair_ids is not None:
-            # Pad pair_ids to match input_ids length
             padded_pair_ids = torch.full_like(input_ids, 0)
             padded_pair_ids[:, :pair_ids.size(1)] = pair_ids
             x += self.pair_embedding(padded_pair_ids)

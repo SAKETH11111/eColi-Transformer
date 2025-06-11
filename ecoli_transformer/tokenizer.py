@@ -4,10 +4,12 @@ from typing import List, Tuple, Dict
 
 BASES = ['A', 'T', 'G', 'C']
 CODON_LIST = [''.join(p) for p in itertools.product(BASES, repeat=3)]
+AMINO_ACIDS = 'ACDEFGHIKLMNPQRSTVWY'
+UNK_AA_TOKENS = [f"{aa}_UNK" for aa in AMINO_ACIDS]
 
 SPECIALS = ['[PAD]', '[MASK]', '[CLS]', '[SEP]']
 
-VOCAB = SPECIALS + CODON_LIST
+VOCAB = SPECIALS + CODON_LIST + UNK_AA_TOKENS
 VOCAB_SIZE = len(VOCAB)
 
 CODON_TO_ID: Dict[str, int] = {token: i for i, token in enumerate(VOCAB)}
@@ -22,6 +24,25 @@ PAD_ID = CODON_TO_ID['[PAD]']
 MASK_ID = CODON_TO_ID['[MASK]']
 CLS_ID = CODON_TO_ID['[CLS]']
 SEP_ID = CODON_TO_ID['[SEP]']
+
+RESTRICTION_SITES = {
+    "EcoRI": "GAATTC",
+    "HindIII": "AAGCTT",
+    "BamHI": "GGATCC",
+    "BglII": "AGATCT",
+    "XhoI": "CTCGAG",
+}
+
+AA_TO_CODONS = {
+    'A': ['GCT', 'GCC', 'GCA', 'GCG'], 'C': ['TGT', 'TGC'], 'D': ['GAT', 'GAC'],
+    'E': ['GAA', 'GAG'], 'F': ['TTT', 'TTC'], 'G': ['GGT', 'GGC', 'GGA', 'GGG'],
+    'H': ['CAT', 'CAC'], 'I': ['ATT', 'ATC', 'ATA'], 'K': ['AAA', 'AAG'],
+    'L': ['TTA', 'TTG', 'CTT', 'CTC', 'CTA', 'CTG'], 'M': ['ATG'],
+    'N': ['AAT', 'AAC'], 'P': ['CCT', 'CCC', 'CCA', 'CCG'], 'Q': ['CAA', 'CAG'],
+    'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'], 'S': ['TCT', 'TCC', 'TCA', 'TCG', 'AGT', 'AGC'],
+    'T': ['ACT', 'ACC', 'ACA', 'ACG'], 'V': ['GTT', 'GTC', 'GTA', 'GTG'],
+    'W': ['TGG'], 'Y': ['TAT', 'TAC'], '*': ['TAA', 'TAG', 'TGA']
+}
 
 class CodonTokenizer:
     """
@@ -77,6 +98,10 @@ class CodonTokenizer:
         """Decodes a list of token IDs back into a string (codons joined)."""
         codons = [self.id_to_codon[id_] for id_ in token_ids if id_ not in [self.cls_id, self.sep_id, self.pad_id]]
         return "".join(codons)
+
+    def is_stop_codon(self, codon: str) -> bool:
+        """Checks if a codon is a stop codon."""
+        return codon in ['TAA', 'TAG', 'TGA']
 
     def mask(self, token_ids: List[int], mask_prob=0.15, random_prob=0.1, keep_prob=0.1) -> Tuple[List[int], List[int]]:
         """
@@ -139,4 +164,4 @@ if __name__ == '__main__':
     token_ids_short, pair_ids_short = tokenizer.encode_cds(cds_short)
     print(f"\nCDS Short: {cds_short}")
     print(f"Token IDs: {token_ids_short}")
-    print(f"Pair IDs: {pair_ids_short}") 
+    print(f"Pair IDs: {pair_ids_short}")

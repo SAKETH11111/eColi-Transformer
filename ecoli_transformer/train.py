@@ -13,13 +13,11 @@ from sklearn.metrics import r2_score
 import numpy as np
 from tqdm import tqdm
 
-# Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
 
-# --- Dataset Class ---
 class GeneDataset(Dataset):
     def __init__(self, pt_file, tiny=False):
         data = torch.load(pt_file)
@@ -33,9 +31,8 @@ class GeneDataset(Dataset):
         self.cai = data['cai']
         self.mfe = data['mfe']
         
-        # Vocab info (assuming from a tokenizer)
         self.pad_token_id = 0
-        self.mask_token_id = 65 # Assuming 64 codons + MASK
+        self.mask_token_id = 65
         self.cls_token_id = 66
         self.sep_token_id = 67
         self.codon_vocab_size = 64
@@ -49,7 +46,6 @@ class GeneDataset(Dataset):
         cai = self.cai[idx]
         mfe = self.mfe[idx]
 
-        # Dynamic Masking
         input_ids, mlm_labels = self.dynamic_mask(token_ids)
 
         return {
@@ -63,24 +59,19 @@ class GeneDataset(Dataset):
     def dynamic_mask(self, token_ids):
         labels = token_ids.clone()
         
-        # Probability matrix for masking (15%)
         prob_matrix = torch.full(labels.shape, 0.15)
         
-        # Don't mask special tokens
         special_tokens_mask = (token_ids == self.cls_token_id) | \
                               (token_ids == self.sep_token_id) | \
                               (token_ids == self.pad_token_id)
         prob_matrix.masked_fill_(special_tokens_mask, value=0.0)
         
-        # Apply mask
         masked_indices = torch.bernoulli(prob_matrix).bool()
-        labels[~masked_indices] = -100  # Ignore non-masked tokens in loss
+        labels[~masked_indices] = -100
 
-        # 80% of the time, replace with [MASK]
         indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
         token_ids[indices_replaced] = self.mask_token_id
 
-        # 10% of the time, replace with a random codon
         indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
         random_words = torch.randint(0, self.codon_vocab_size, labels.shape, dtype=torch.long)
         token_ids[indices_random] = random_words[indices_random]
@@ -99,7 +90,6 @@ def collate_fn(batch):
 
     return input_ids, pair_ids, attention_mask, mlm_labels, cai, dg
 
-# --- Main Training Script ---
 def main():
     parser = argparse.ArgumentParser(description="Train eColi Transformer Model")
     parser.add_argument("--train_pt", type=str, required=True, help="Path to training .pt file")
@@ -122,17 +112,14 @@ def main():
     if args.tiny:
         args.epochs = 1
 
-    # --- Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     Path(args.save).parent.mkdir(parents=True, exist_ok=True)
 
-    # --- Data ---
     train_dataset = GeneDataset(args.train_pt, tiny=args.tiny)
     val_dataset = GeneDataset(args.val_pt, tiny=args.tiny)
 
-    # --- Normalization ---
     cai_mean, cai_std = train_dataset.cai.mean(), train_dataset.cai.std()
     mfe_mean, mfe_std = train_dataset.mfe.mean(), train_dataset.mfe.std()
     
@@ -144,7 +131,6 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
-    # --- Model & Optimizer ---
     model = CodonEncoder().to(device)
 
     if args.load_checkpoint and Path(args.load_checkpoint).exists():
@@ -184,19 +170,16 @@ def main():
     epochs_no_improve = 0
     start_epoch = 0
 
-    # --- Checkpoint Resuming ---
     if args.resume and Path(args.resume).exists():
         print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model_state_dict'])
-        # Only load optimizer and scheduler if not freezing encoder
         if not args.freeze_encoder:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_mlm_acc = checkpoint.get('best_val_mlm_acc', -1)
 
-    # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_train_loss = 0
@@ -221,7 +204,6 @@ def main():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             
-            # Added value clipping for stability
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad.data.clamp_(-1.0, 1.0)
@@ -243,7 +225,6 @@ def main():
                     'grad_norm': grad_norm.item()
                 })
 
-        # --- Validation ---
         model.eval()
         total_val_loss = 0
         all_mlm_preds = []
@@ -261,12 +242,10 @@ def main():
                 with torch.amp.autocast('cuda'):
                     mlm_logits, _, cai_pred, dg_pred = model(input_ids, pair_ids, attention_mask)
 
-                # MLM Accuracy
                 masked_tokens = mlm_labels != -100
                 all_mlm_preds.append(mlm_logits[masked_tokens].argmax(dim=-1))
                 all_mlm_labels.append(mlm_labels[masked_tokens])
 
-                # R2 and RMSE
                 all_cai_preds.append(cai_pred.squeeze())
                 all_cai_targets.append(cai_target)
                 all_dg_preds.append(dg_pred.squeeze())
@@ -282,10 +261,6 @@ def main():
         dg_targets_np = torch.cat(all_dg_targets).cpu().numpy()
         val_dg_rmse = np.sqrt(np.mean((dg_preds_np[~np.isnan(dg_targets_np)] - dg_targets_np[~np.isnan(dg_targets_np)])**2))
 
-        print(f"Epoch {epoch}: train_loss {total_train_loss / len(train_loader):.2f} | val_MLM_acc {val_mlm_acc:.2f} | val_CAI_R2 {val_cai_r2:.2f} | val_dG_RMSE {val_dg_rmse:.2f}")
-
-        # --- Composite Score Checkpointing ---
-        # Normalize dG_RMSE by a reasonable maximum to balance its contribution
         max_dg_rmse = 50.0 
         composite_score = val_mlm_acc + val_cai_r2 - (val_dg_rmse / max_dg_rmse)
 
