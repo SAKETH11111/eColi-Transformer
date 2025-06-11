@@ -145,7 +145,7 @@ def main():
         )
 
     scheduler = LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     best_val_mlm_acc = -1
     start_epoch = 0
@@ -170,7 +170,7 @@ def main():
             batch = [t.to(device) for t in batch]
             input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
 
-            with autocast():
+            with torch.amp.autocast('cuda'):
                 mlm_logits, loss = model(
                     input_ids=input_ids, 
                     pair_ids=pair_ids, 
@@ -185,8 +185,8 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             optimizer.zero_grad()
+            scheduler.step()
 
             total_train_loss += loss.item()
 
@@ -208,7 +208,7 @@ def main():
                 batch = [t.to(device) for t in batch]
                 input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
                 
-                with autocast():
+                with torch.amp.autocast('cuda'):
                     mlm_logits, _ = model(input_ids, pair_ids, attention_mask)
                     cai_pred = model.cai_head(model.transformer_encoder(model.token_embedding(input_ids) + model.positional_encoding[:, :input_ids.size(1), :], src_key_padding_mask=attention_mask).mean(dim=1))
                     dg_pred = model.dg_head(model.transformer_encoder(model.token_embedding(input_ids) + model.positional_encoding[:, :input_ids.size(1), :], src_key_padding_mask=attention_mask).mean(dim=1))
