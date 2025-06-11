@@ -1,90 +1,251 @@
+import argparse
+import os
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from pathlib import Path
-import argparse
-import sys
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from sklearn.metrics import r2_score
+import numpy as np
+from tqdm import tqdm
 
-# Add project root to the Python path
+# Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
 
-def train(model, dataloader, optimizer, device):
-    model.train()
-    total_loss = 0
-    for batch in dataloader:
-        # Ensure all tensors in the batch are moved to the correct device
-        input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = [t.to(device) for t in batch]
-
-        optimizer.zero_grad()
-        _, loss = model(input_ids=input_ids, pair_ids=pair_ids, attention_mask=attention_mask,
-                        mlm_labels=mlm_labels, cai_target=cai_target, dg_target=dg_target)
+# --- Dataset Class ---
+class GeneDataset(Dataset):
+    def __init__(self, pt_file, tiny=False):
+        data = torch.load(pt_file)
         
-        if loss is not None:
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        if tiny:
+            print("Using --tiny flag: loading only first 500 sequences.")
+            data = {k: v[:500] for k, v in data.items()}
 
-    return total_loss / len(dataloader)
+        self.token_ids = data['token_ids']
+        self.pair_ids = data['pair_ids']
+        self.cai = data['cai']
+        self.mfe = data['mfe']
+        
+        # Vocab info (assuming from a tokenizer)
+        self.pad_token_id = 0
+        self.mask_token_id = 65 # Assuming 64 codons + MASK
+        self.cls_token_id = 66
+        self.sep_token_id = 67
+        self.codon_vocab_size = 64
 
+    def __len__(self):
+        return len(self.token_ids)
+
+    def __getitem__(self, idx):
+        token_ids = self.token_ids[idx]
+        pair_ids = self.pair_ids[idx]
+        cai = self.cai[idx]
+        mfe = self.mfe[idx]
+
+        # Dynamic Masking
+        input_ids, mlm_labels = self.dynamic_mask(token_ids)
+
+        return {
+            "input_ids": input_ids,
+            "pair_ids": pair_ids,
+            "mlm_labels": mlm_labels,
+            "cai": cai,
+            "dg": mfe
+        }
+
+    def dynamic_mask(self, token_ids):
+        labels = token_ids.clone()
+        
+        # Probability matrix for masking (15%)
+        prob_matrix = torch.full(labels.shape, 0.15)
+        
+        # Don't mask special tokens
+        special_tokens_mask = (token_ids == self.cls_token_id) | \
+                              (token_ids == self.sep_token_id) | \
+                              (token_ids == self.pad_token_id)
+        prob_matrix.masked_fill_(special_tokens_mask, value=0.0)
+        
+        # Apply mask
+        masked_indices = torch.bernoulli(prob_matrix).bool()
+        labels[~masked_indices] = -100  # Ignore non-masked tokens in loss
+
+        # 80% of the time, replace with [MASK]
+        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+        token_ids[indices_replaced] = self.mask_token_id
+
+        # 10% of the time, replace with a random codon
+        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+        random_words = torch.randint(0, self.codon_vocab_size, labels.shape, dtype=torch.long)
+        token_ids[indices_random] = random_words[indices_random]
+        
+        # 10% of the time, keep the original token
+        # (Nothing to do here)
+
+        return token_ids, labels
+
+def collate_fn(batch):
+    input_ids = pad_sequence([item['input_ids'] for item in batch], batch_first=True, padding_value=0)
+    pair_ids = pad_sequence([item['pair_ids'] for item in batch], batch_first=True, padding_value=0)
+    mlm_labels = pad_sequence([item['mlm_labels'] for item in batch], batch_first=True, padding_value=-100)
+    
+    attention_mask = (input_ids != 0).float()
+    
+    cai = torch.tensor([item['cai'] for item in batch], dtype=torch.float)
+    dg = torch.tensor([item['dg'] for item in batch], dtype=torch.float)
+
+    return input_ids, pair_ids, attention_mask, mlm_labels, cai, dg
+
+# --- Main Training Script ---
 def main():
-    parser = argparse.ArgumentParser(description="Train CodonEncoder model.")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to the training data .pt file.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser = argparse.ArgumentParser(description="Train eColi Transformer Model")
+    parser.add_argument("--train_pt", type=str, required=True, help="Path to training .pt file")
+    parser.add_argument("--val_pt", type=str, required=True, help="Path to validation .pt file")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--save", type=str, default="checkpoints/baseline.pt", help="Path to save best checkpoint")
+    parser.add_argument("--tiny", action="store_true", help="Train on a tiny subset for testing")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
 
-    # --- Device Selection (Optimized for Server/M2 Mac) ---
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using NVIDIA GPU (CUDA).")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using Apple Silicon GPU (MPS).")
-    else:
-        device = torch.device("cpu")
-        print("No GPU available. Using CPU.")
-    # ----------------------------------------------------
+    if args.tiny:
+        args.epochs = 1
 
-    print(f"Loading data from {args.data_path}...")
-    data = torch.load(args.data_path, map_location=device) # Load directly to the target device
+    # --- Setup ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    # Pad sequences to the max length in the batch
-    # Using padding_value=0 for tokenizer's pad token
-    padded_token_ids = torch.nn.utils.rnn.pad_sequence(data['token_ids'], batch_first=True, padding_value=0)
-    padded_pair_ids = torch.nn.utils.rnn.pad_sequence(data['pair_ids'], batch_first=True, padding_value=0)
-    
-    # Create attention masks (1 for real tokens, 0 for padding)
-    attention_mask = (padded_token_ids != 0).float()
+    Path(args.save).parent.mkdir(parents=True, exist_ok=True)
 
-    # For MLM, we typically use the original token_ids as labels.
-    # The loss function will ignore the non-masked tokens.
-    mlm_labels = padded_token_ids.clone()
+    # --- Data ---
+    train_dataset = GeneDataset(args.train_pt, tiny=args.tiny)
+    val_dataset = GeneDataset(args.val_pt, tiny=args.tiny)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
-    dataset = TensorDataset(
-        padded_token_ids,
-        padded_pair_ids,
-        attention_mask,
-        mlm_labels,
-        data['cai'],
-        data['mfe']
-    )
-    
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-
+    # --- Model & Optimizer ---
     model = CodonEncoder().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = AdamW(model.parameters(), lr=args.lr)
+    
+    num_training_steps = args.epochs * len(train_loader)
+    num_warmup_steps = int(0.1 * num_training_steps)
+    
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return max(
+            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+        )
 
-    print(f"Starting training for {args.epochs} epochs on device: {device}")
-    for epoch in range(args.epochs):
-        avg_loss = train(model, dataloader, optimizer, device)
-        print(f"Epoch {epoch+1}/{args.epochs}, Average Loss: {avg_loss:.4f}")
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    scaler = GradScaler()
 
-    print("Training complete.")
+    best_val_mlm_acc = -1
+    start_epoch = 0
+
+    # --- Checkpoint Resuming ---
+    if args.resume and Path(args.resume).exists():
+        print(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_mlm_acc = checkpoint.get('best_val_mlm_acc', -1)
+
+    # --- Training Loop ---
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        total_train_loss = 0
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
+        for i, batch in enumerate(progress_bar):
+            batch = [t.to(device) for t in batch]
+            input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
+
+            with autocast():
+                mlm_logits, loss = model(
+                    input_ids=input_ids, 
+                    pair_ids=pair_ids, 
+                    attention_mask=attention_mask,
+                    mlm_labels=mlm_labels, 
+                    cai_target=cai_target, 
+                    dg_target=dg_target
+                )
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            total_train_loss += loss.item()
+
+            if (i + 1) % 100 == 0:
+                progress_bar.set_postfix({'train_loss': total_train_loss / (i + 1)})
+
+        # --- Validation ---
+        model.eval()
+        total_val_loss = 0
+        all_mlm_preds = []
+        all_mlm_labels = []
+        all_cai_preds = []
+        all_cai_targets = []
+        all_dg_preds = []
+        all_dg_targets = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = [t.to(device) for t in batch]
+                input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = batch
+                
+                with autocast():
+                    mlm_logits, _ = model(input_ids, pair_ids, attention_mask)
+                    cai_pred = model.cai_head(model.transformer_encoder(model.token_embedding(input_ids) + model.positional_encoding[:, :input_ids.size(1), :], src_key_padding_mask=attention_mask).mean(dim=1))
+                    dg_pred = model.dg_head(model.transformer_encoder(model.token_embedding(input_ids) + model.positional_encoding[:, :input_ids.size(1), :], src_key_padding_mask=attention_mask).mean(dim=1))
+
+                # MLM Accuracy
+                masked_tokens = mlm_labels != -100
+                all_mlm_preds.append(mlm_logits[masked_tokens].argmax(dim=-1))
+                all_mlm_labels.append(mlm_labels[masked_tokens])
+
+                # R2 and RMSE
+                all_cai_preds.append(cai_pred.squeeze())
+                all_cai_targets.append(cai_target)
+                all_dg_preds.append(dg_pred.squeeze())
+                all_dg_targets.append(dg_target)
+
+        val_mlm_acc = (torch.cat(all_mlm_preds) == torch.cat(all_mlm_labels)).float().mean().item()
+        
+        cai_preds_np = torch.cat(all_cai_preds).cpu().numpy()
+        cai_targets_np = torch.cat(all_cai_targets).cpu().numpy()
+        val_cai_r2 = r2_score(cai_targets_np[~np.isnan(cai_targets_np)], cai_preds_np[~np.isnan(cai_targets_np)])
+        
+        dg_preds_np = torch.cat(all_dg_preds).cpu().numpy()
+        dg_targets_np = torch.cat(all_dg_targets).cpu().numpy()
+        val_dg_rmse = np.sqrt(np.mean((dg_preds_np[~np.isnan(dg_targets_np)] - dg_targets_np[~np.isnan(dg_targets_np)])**2))
+
+        print(f"Epoch {epoch}: train_loss {total_train_loss / len(train_loader):.2f} | val_MLM_acc {val_mlm_acc:.2f} | val_CAI_R2 {val_cai_r2:.2f} | val_dG_RMSE {val_dg_rmse:.2f}")
+
+        if val_mlm_acc > best_val_mlm_acc:
+            best_val_mlm_acc = val_mlm_acc
+            print(f"Saved checkpoint: {args.save}")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_mlm_acc': best_val_mlm_acc,
+            }, args.save)
 
 if __name__ == "__main__":
     main()

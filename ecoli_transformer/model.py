@@ -3,11 +3,11 @@ import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 class CodonEncoder(nn.Module):
-    def __init__(self, vocab_size=68, pair_vocab_size=4096, hidden_dim=512, nhead=8, num_layers=6, dim_feedforward=2048):
+    def __init__(self, vocab_size=68, pair_vocab_size=4096, hidden_dim=512, nhead=8, num_layers=6, dim_feedforward=2048, max_seq_len=4096):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.pair_embedding = nn.Embedding(pair_vocab_size, hidden_dim)
-        self.positional_encoding = nn.Parameter(torch.zeros(1, 512, hidden_dim))
+        self.positional_encoding = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
 
         encoder_layers = TransformerEncoderLayer(hidden_dim, nhead, dim_feedforward, batch_first=True, norm_first=True)
         self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers)
