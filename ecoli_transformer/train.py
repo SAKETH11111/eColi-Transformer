@@ -4,6 +4,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 import argparse
+import sys
+
+# Add project root to the Python path
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
 
@@ -11,6 +16,7 @@ def train(model, dataloader, optimizer, device):
     model.train()
     total_loss = 0
     for batch in dataloader:
+        # Ensure all tensors in the batch are moved to the correct device
         input_ids, pair_ids, attention_mask, mlm_labels, cai_target, dg_target = [t.to(device) for t in batch]
 
         optimizer.zero_grad()
@@ -32,34 +38,38 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     args = parser.parse_args()
 
-    # --- M2 Mac Optimization ---
-    if torch.backends.mps.is_available():
+    # --- Device Selection (Optimized for Server/M2 Mac) ---
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using NVIDIA GPU (CUDA).")
+    elif torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using Apple Silicon GPU (MPS).")
     else:
         device = torch.device("cpu")
-        print("MPS not available. Using CPU.")
-    # -------------------------
+        print("No GPU available. Using CPU.")
+    # ----------------------------------------------------
 
-    data = torch.load(args.data_path)
-    
-    # Dummy tensors for demonstration if not present in your .pt file
-    # In a real scenario, you would have your actual data here
-    num_samples = len(data['token_ids'])
-    max_len = max(len(t) for t in data['token_ids'])
+    print(f"Loading data from {args.data_path}...")
+    data = torch.load(args.data_path, map_location=device) # Load directly to the target device
     
     # Pad sequences to the max length in the batch
+    # Using padding_value=0 for tokenizer's pad token
     padded_token_ids = torch.nn.utils.rnn.pad_sequence(data['token_ids'], batch_first=True, padding_value=0)
     padded_pair_ids = torch.nn.utils.rnn.pad_sequence(data['pair_ids'], batch_first=True, padding_value=0)
     
-    # Create attention masks
-    attention_mask = (padded_token_ids != 0)
+    # Create attention masks (1 for real tokens, 0 for padding)
+    attention_mask = (padded_token_ids != 0).float()
+
+    # For MLM, we typically use the original token_ids as labels.
+    # The loss function will ignore the non-masked tokens.
+    mlm_labels = padded_token_ids.clone()
 
     dataset = TensorDataset(
         padded_token_ids,
         padded_pair_ids,
         attention_mask,
-        padded_token_ids.clone(),  # Using token_ids as mlm_labels for this example
+        mlm_labels,
         data['cai'],
         data['mfe']
     )
@@ -69,6 +79,7 @@ def main():
     model = CodonEncoder().to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    print(f"Starting training for {args.epochs} epochs on device: {device}")
     for epoch in range(args.epochs):
         avg_loss = train(model, dataloader, optimizer, device)
         print(f"Epoch {epoch+1}/{args.epochs}, Average Loss: {avg_loss:.4f}")
