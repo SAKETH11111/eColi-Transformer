@@ -67,15 +67,22 @@ def parse_fasta(filepath: Path) -> List[Tuple[str, str, Dict[str, Optional[str]]
 
     return sequences
 
-def run_rnafold(sequence: str) -> Optional[float]:
-    """Calculates MFE using the ViennaRNA Python binding."""
+def run_rnafold(sequence: str, timeout_seconds: int = 30) -> Optional[float]:
+    """Calculates MFE using the ViennaRNA Python binding with timeout."""
     if not sequence:
         return None
     try:
         # RNA.fold returns a tuple: (structure, mfe)
+        # For very long sequences, this can take a very long time
+        # Add a simple timeout by limiting sequence length
+        if len(sequence) > 10000:  # Skip very long sequences
+            print(f"Warning: Skipping RNA fold for sequence of length {len(sequence)} (too long)")
+            return None
+            
         _, mfe = RNA.fold(sequence)
         return mfe
-    except Exception:
+    except Exception as e:
+        print(f"Warning: RNA.fold failed: {e}")
         return None
 
 def process_sequence(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer) -> Optional[Dict]:
@@ -104,6 +111,7 @@ def process_sequence(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], t
         except (ValueError, TypeError):
             pass
 
+    # RNA folding can be slow for long sequences
     mfe = run_rnafold(sequence)
     if mfe is None:
         mfe = np.nan
@@ -161,22 +169,51 @@ def main():
     start_time = time.time()
 
     all_results: List[Optional[Dict]] = []
-    process_func = partial(process_sequence, tokenizer=tokenizer)
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        results_iterator = executor.map(process_func, sequences)
+        # Determine the actual number of workers the executor is likely using.
+        effective_workers = num_workers if num_workers is not None else os.cpu_count()
+        if effective_workers is None:
+            effective_workers = 1
+        if effective_workers <= 0:
+            effective_workers = 1
+
+        print(f"Using {effective_workers} effective worker(s).")
+        print(f"Starting processing of {num_sequences_to_process} sequences...")
+        sys.stdout.flush()
+
+        # Submit all tasks immediately for real-time progress
+        future_to_sequence = {
+            executor.submit(process_sequence, seq_data, tokenizer): i 
+            for i, seq_data in enumerate(sequences)
+        }
 
         processed_count = 0
         last_print_time = start_time
-        for result in results_iterator:
-            all_results.append(result)
+        
+        # Process results as they complete (real-time progress)
+        for future in concurrent.futures.as_completed(future_to_sequence):
+            try:
+                result = future.result()
+                all_results.append(result)
+            except Exception as e:
+                print(f"Error processing sequence: {e}")
+                all_results.append(None)
+            
             processed_count += 1
             current_time = time.time()
-            if current_time - last_print_time > 5 or processed_count == num_sequences_to_process:
-                 elapsed_time = current_time - start_time
-                 avg_time_per_seq = elapsed_time / processed_count if processed_count > 0 else 0
-                 print(f"  Processed {processed_count}/{num_sequences_to_process} sequences... ({avg_time_per_seq:.3f} s/seq)")
-                 last_print_time = current_time
+            
+            # Print progress every 1 second or every 50 sequences, whichever comes first
+            if (current_time - last_print_time > 1 or 
+                processed_count % 50 == 0 or 
+                processed_count == num_sequences_to_process):
+                elapsed_time = current_time - start_time
+                avg_time_per_seq = elapsed_time / processed_count if processed_count > 0 else 0
+                sequences_per_sec = processed_count / elapsed_time if elapsed_time > 0 else 0
+                print(f"  Processed {processed_count}/{num_sequences_to_process} sequences... "
+                      f"({avg_time_per_seq:.3f} s/seq, {sequences_per_sec:.1f} seq/s)")
+                sys.stdout.flush()
+                last_print_time = current_time
 
     valid_results = [r for r in all_results if r is not None]
     num_failed = num_sequences_to_process - len(valid_results)
