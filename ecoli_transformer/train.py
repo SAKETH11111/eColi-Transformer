@@ -84,9 +84,6 @@ class GeneDataset(Dataset):
         indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
         random_words = torch.randint(0, self.codon_vocab_size, labels.shape, dtype=torch.long)
         token_ids[indices_random] = random_words[indices_random]
-        
-        # 10% of the time, keep the original token
-        # (Nothing to do here)
 
         return token_ids, labels
 
@@ -115,6 +112,9 @@ def main():
     parser.add_argument("--dg_weight", type=float, default=0.2, help="Weight for dG loss")
     parser.add_argument("--tiny", action="store_true", help="Train on a tiny subset for testing")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to load a checkpoint from, without resuming optimizer state")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+    parser.add_argument("--freeze_encoder", action="store_true", help="Freeze the transformer encoder layers")
     args = parser.parse_args()
 
     if args.tiny:
@@ -144,7 +144,24 @@ def main():
 
     # --- Model & Optimizer ---
     model = CodonEncoder().to(device)
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+
+    if args.load_checkpoint and Path(args.load_checkpoint).exists():
+        print(f"Loading model weights from checkpoint: {args.load_checkpoint}")
+        checkpoint = torch.load(args.load_checkpoint)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+    if args.freeze_encoder:
+        print("Freezing encoder layers. Only training regression heads.")
+        for param in model.token_embedding.parameters():
+            param.requires_grad = False
+        for param in model.pair_embedding.parameters():
+            param.requires_grad = False
+        for param in model.transformer_encoder.parameters():
+            param.requires_grad = False
+        
+        optimizer = AdamW(list(model.cai_head.parameters()) + list(model.dg_head.parameters()), lr=args.lr)
+    else:
+        optimizer = AdamW(model.parameters(), lr=args.lr)
     
     num_training_steps = args.epochs * len(train_loader)
     num_warmup_steps = int(0.1 * num_training_steps)
@@ -160,6 +177,7 @@ def main():
     scaler = torch.amp.GradScaler('cuda')
 
     best_val_mlm_acc = -1
+    epochs_no_improve = 0
     start_epoch = 0
 
     # --- Checkpoint Resuming ---
@@ -196,16 +214,28 @@ def main():
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # Added value clipping for stability
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.data.clamp_(-1.0, 1.0)
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
             scheduler.step()
 
+            if torch.isnan(loss):
+                print(f"NaN loss detected at step {i}. Stopping training.")
+                break
             total_train_loss += loss.item()
 
             if (i + 1) % 100 == 0:
-                progress_bar.set_postfix({'train_loss': total_train_loss / (i + 1)})
+                progress_bar.set_postfix({
+                    'train_loss': total_train_loss / (i + 1),
+                    'grad_norm': grad_norm.item()
+                })
 
         # --- Validation ---
         model.eval()
@@ -250,6 +280,7 @@ def main():
 
         if val_mlm_acc > best_val_mlm_acc:
             best_val_mlm_acc = val_mlm_acc
+            epochs_no_improve = 0
             print(f"Saved checkpoint: {args.save}")
             torch.save({
                 'epoch': epoch,
@@ -258,6 +289,12 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_val_mlm_acc': best_val_mlm_acc,
             }, args.save)
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= args.patience:
+            print(f"Early stopping triggered after {args.patience} epochs with no improvement.")
+            break
 
 if __name__ == "__main__":
     main()
