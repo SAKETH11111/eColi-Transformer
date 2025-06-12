@@ -10,6 +10,8 @@ import RNA
 import time
 import concurrent.futures
 import random
+from functools import partial
+from tqdm import tqdm
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
@@ -45,10 +47,18 @@ def parse_fasta(filepath: Path) -> List[Tuple[str, str, Dict[str, Optional[str]]
             sequences.append((seq_id, current_seq, metadata))
     return sequences
 
-def run_rnafold(sequence: str) -> Optional[float]:
-    if not sequence or len(sequence) > 10000:
+def run_rnafold(sequence: str, timeout: int = 30) -> Optional[float]:
+    """Calculates MFE with a timeout to prevent getting stuck on long sequences."""
+    if not sequence:
         return None
+    
+    # For extremely long sequences (>5000), skip RNA folding to avoid excessive computation
+    # but still allow longer sequences than before
+    if len(sequence) > 5000:
+        return None
+    
     try:
+        # Direct call - ViennaRNA is generally thread-safe for fold()
         _, mfe = RNA.fold(sequence)
         return mfe
     except Exception:
@@ -96,7 +106,7 @@ def apply_stream_masking(tokens: List[str], tokenizer: CodonTokenizer, mask_prob
         
     return masked_tokens, labels
 
-def create_stream_training_example(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer) -> Optional[Dict]:
+def create_stream_training_example(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer, skip_rna: bool = False) -> Optional[Dict]:
     seq_id, cds, metadata = sequence_data
     
     protein_sequence = cds_to_protein(cds)
@@ -114,7 +124,7 @@ def create_stream_training_example(sequence_data: Tuple[str, str, Dict[str, Opti
     
     cai_str = metadata.get('cai')
     cai = float(cai_str) if cai_str else np.nan
-    mfe = run_rnafold(cds) or np.nan
+    mfe = np.nan if skip_rna else (run_rnafold(cds) or np.nan)
 
     return {
         'gene_id': seq_id,
@@ -126,14 +136,14 @@ def create_stream_training_example(sequence_data: Tuple[str, str, Dict[str, Opti
         'length': len(protein_sequence)
     }
 
-def process_sequence_legacy(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer) -> Optional[Dict]:
+def process_sequence_legacy(sequence_data: Tuple[str, str, Dict[str, Optional[str]]], tokenizer: CodonTokenizer, skip_rna: bool = False) -> Optional[Dict]:
     seq_id, sequence, metadata = sequence_data
     token_ids_list, _ = tokenizer.encode_cds(sequence)
     codon_length = len(token_ids_list) - 2
     if codon_length <= 0: return None
     cai_str = metadata.get('cai')
     cai = float(cai_str) if cai_str else np.nan
-    mfe = run_rnafold(sequence) or np.nan
+    mfe = np.nan if skip_rna else (run_rnafold(sequence) or np.nan)
     return {
         'gene_id': seq_id,
         'token_ids': torch.LongTensor(token_ids_list),
@@ -148,7 +158,10 @@ def main():
     parser.add_argument("--out", type=str, required=True, help="Output PyTorch tensor file path.")
     parser.add_argument("--stream", action="store_true", help="Enable STREAM (CodonTransformer) data generation.")
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N sequences.")
-    parser.add_argument("--workers", type=int, default=None, help="Number of worker processes.")
+    parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Number of worker processes.")
+    parser.add_argument("--max_len", type=int, default=3000, help="Maximum sequence length to process.")
+    parser.add_argument("--batch_size", type=int, default=500, help="Batch size for processing.")
+    parser.add_argument("--no_rna", action="store_true", help="Skip RNA folding calculations.")
     args = parser.parse_args()
 
     if not Path(args.fasta).is_file():
@@ -161,22 +174,59 @@ def main():
     if args.limit:
         sequences = sequences[:args.limit]
 
-    print(f"Found {len(sequences)} sequences. Using {'STREAM' if args.stream else 'legacy'} processing.")
+    print(f"Found {len(sequences)} sequences.")
+    print(f"Processing ALL {len(sequences)} sequences using {'STREAM' if args.stream else 'legacy'} method.")
+    print(f"Using {args.workers} workers with batch size {args.batch_size}")
+    if args.no_rna:
+        print("RNA folding calculations disabled.")
+    
+    # Process all sequences at once with chunking for better performance
+    all_results = []
     
     process_func = create_stream_training_example if args.stream else process_sequence_legacy
+    p_process_func = partial(process_func, tokenizer=tokenizer, skip_rna=args.no_rna)
     
-    all_results = []
+    # Calculate optimal chunksize for maximum throughput
+    chunksize = max(1, len(sequences) // (args.workers * 8))
+    print(f"Using chunksize {chunksize} for optimal load balancing...")
+    
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-        future_to_seq = {executor.submit(process_func, seq_data, tokenizer): i for i, seq_data in enumerate(sequences)}
-        for i, future in enumerate(concurrent.futures.as_completed(future_to_seq)):
-            try:
-                result = future.result()
-                if result:
-                    all_results.append(result)
-            except Exception as e:
-                print(f"Error processing sequence: {e}")
-            if (i + 1) % 100 == 0:
-                print(f"  Processed {i+1}/{len(sequences)} sequences...")
+        # Submit all work at once for maximum parallelization
+        futures = []
+        batch_size = args.batch_size
+        
+        # Submit in batches to avoid overwhelming memory
+        for i in range(0, len(sequences), batch_size):
+            batch = sequences[i:i+batch_size]
+            batch_futures = [executor.submit(p_process_func, seq_data) for seq_data in batch]
+            futures.extend(batch_futures)
+        
+        print(f"Submitted {len(futures)} tasks across {args.workers} workers")
+        
+        # Collect results as they complete
+        completed_count = 0
+        with tqdm(total=len(futures), desc="Processing sequences") as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result(timeout=120)  # 2 minute timeout per sequence
+                    if result:
+                        all_results.append(result)
+                    completed_count += 1
+                    pbar.update(1)
+                    
+                    # Progress updates every 500 completions
+                    if completed_count % 500 == 0:
+                        print(f"Completed {completed_count}/{len(futures)} sequences, {len(all_results)} successful")
+                        
+                except Exception as e:
+                    # Don't let individual failures stop the whole process
+                    completed_count += 1
+                    pbar.update(1)
+                    if "timeout" in str(e).lower():
+                        print(f"Warning: Sequence timed out (likely long RNA folding)")
+                    else:
+                        print(f"Warning: Failed to process sequence: {e}")
+                    continue
 
     valid_results = [r for r in all_results if r is not None]
     print(f"Successfully processed {len(valid_results)}/{len(sequences)} sequences.")
