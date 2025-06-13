@@ -1,28 +1,83 @@
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.ENV/
 
-
-# notebooks
-.ipynb_checkpoints/
-
-# python artefacts
+# Python cache and compiled files
 __pycache__/
 *.py[cod]
 *.pyd
 *.so
+*.pyc
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
 
-# checkpoints & logs
-checkpoints/
-wandb/
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
 
-# env / IDE
+# ML/Data Science
+*.pt
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.weights
+*.npy
+*.npz
+
+# data/raw/
+# data/processed/*.fasta
+# data/processed/*.csv
+
+# Logs and outputs
+logs/
+outputs/
+runs/
+*.log
+*.out
+*.err
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables
 .env
 .env.*
+.envrc
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
 
-# misc
-*.pt
-*.egg-info/
-.DS_Store
+# Conda
+condaenv.*.requirements.txt
+environment.lock
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+
 Goal_of_project.md
 OpenCode.md
 .opencode
