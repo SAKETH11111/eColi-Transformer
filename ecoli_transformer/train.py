@@ -75,13 +75,19 @@ def main():
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
     parser.add_argument("--freeze_encoder", action="store_true", help="Freeze the transformer encoder layers")
     parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of warmup steps for the scheduler")
+    parser.add_argument("--warmup_ratio", type=float, default=None, help="Warmup ratio of total training steps")
     parser.add_argument("--lr_scheduler", type=str, default="linear", choices=["linear", "cosine"], help="LR scheduler type")
     args = parser.parse_args()
 
     if args.tiny:
         args.epochs = 1
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
     
     Path(args.save).parent.mkdir(parents=True, exist_ok=True)
@@ -122,18 +128,25 @@ def main():
     
     num_training_steps = args.epochs * len(train_loader)
     
+    warmup_steps = args.warmup_steps
+    if args.warmup_ratio is not None:
+        warmup_steps = int(num_training_steps * args.warmup_ratio)
+        print(f"Using warmup ratio of {args.warmup_ratio}, which corresponds to {warmup_steps} steps.")
+
     if args.lr_scheduler == 'cosine':
         from torch.optim.lr_scheduler import CosineAnnealingLR
-        scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps - args.warmup_steps)
+        scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps - warmup_steps)
     else: # linear
         def lr_lambda(current_step):
-            if current_step < args.warmup_steps:
-                return float(current_step) / float(max(1, args.warmup_steps))
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
             return max(
-                0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - args.warmup_steps))
+                0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - warmup_steps))
             )
         scheduler = LambdaLR(optimizer, lr_lambda)
-    scaler = torch.amp.GradScaler('cuda')
+    # Use a GradScaler for mixed-precision training if on CUDA
+    use_amp = device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_composite_score = -float('inf')
     epochs_no_improve = 0
@@ -157,7 +170,7 @@ def main():
         for i, batch in enumerate(progress_bar):
             input_ids, organism_ids, attention_mask, labels, cai_target, dg_target = [t.to(device) for t in batch]
 
-            with torch.amp.autocast('cuda'):
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 mlm_logits, loss, _, _ = model(
                     input_ids=input_ids,
                     organism_ids=organism_ids,
@@ -169,16 +182,16 @@ def main():
                     dg_weight=args.dg_weight
                 )
             
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.data.clamp_(-1.0, 1.0)
-
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
 
@@ -206,7 +219,7 @@ def main():
             for batch in val_loader:
                 input_ids, organism_ids, attention_mask, labels, cai_target, dg_target = [t.to(device) for t in batch]
                 
-                with torch.amp.autocast('cuda'):
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                     mlm_logits, _, cai_pred, dg_pred = model(input_ids, organism_ids=organism_ids, attention_mask=attention_mask)
 
                 masked_tokens = labels != -100
