@@ -24,7 +24,17 @@ PAD_ID = CodonTokenizer().pad_id
 class GeneDataset(Dataset):
     def __init__(self, pt_file, tiny=False):
         data = torch.load(pt_file)
-        
+        # Remove samples with NaN CAI or MFE to prevent NaN loss
+        mask = torch.isfinite(data['cai']) & torch.isfinite(data['mfe'])
+        idxs = mask.nonzero(as_tuple=True)[0]
+        mask_bool = mask.tolist()
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                data[key] = val[idxs]
+            else:
+                # filter Python lists (e.g., input_ids, labels, gene_id)
+                data[key] = [item for item, m in zip(val, mask_bool) if m]
+
         if tiny:
             print("Using --tiny flag: loading only first 500 sequences.")
             data = {k: v[:500] for k, v in data.items()}
@@ -77,21 +87,43 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of warmup steps for the scheduler")
     parser.add_argument("--warmup_ratio", type=float, default=None, help="Warmup ratio of total training steps")
     parser.add_argument("--lr_scheduler", type=str, default="linear", choices=["linear", "cosine"], help="LR scheduler type")
+    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps"], help="Device to use (cpu, cuda, or mps)")
+    parser.add_argument("--accum_steps", type=int, default=1, help="Gradient accumulation steps")
     args = parser.parse_args()
 
     if args.tiny:
         args.epochs = 1
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
+    # Select device: override if specified, else auto-detect
+    if args.device:
+        # Verify requested device support
+        if args.device == "cuda" and not torch.cuda.is_available():
+            print("Warning: CUDA requested but not available; falling back to CPU.")
+            device = torch.device("cpu")
+        elif args.device == "mps" and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and torch.backends.mps.is_built()):
+            print("Warning: MPS requested but not supported by this PyTorch build; falling back to CPU.")
+            device = torch.device("cpu")
+        else:
+            device = torch.device(args.device)
     else:
-        device = torch.device("cpu")
+        # Auto-detect: CUDA > MPS > CPU
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     print(f"Using device: {device}")
-    
-    Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+    # Reduce MPS memory fraction to prevent OOM on Mac GPU
+    if device.type == "mps":
+        try:
+            # Use at most 60% of MPS pool
+            torch.mps.set_per_process_memory_fraction(0.6, device=device)
+            print("Set MPS per-process memory fraction to 0.6")
+        except Exception:
+            pass
 
+    # Initialize datasets, loaders, etc.
     tokenizer = CodonTokenizer()
     train_dataset = GeneDataset(args.train_pt, tiny=args.tiny)
     val_dataset = GeneDataset(args.val_pt, tiny=args.tiny)
@@ -164,13 +196,14 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        total_train_loss = 0
+        optimizer.zero_grad()
+        total_train_loss = 0.0
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
         for i, batch in enumerate(progress_bar):
             input_ids, organism_ids, attention_mask, labels, cai_target, dg_target = [t.to(device) for t in batch]
 
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(device_type=amp_device_type, dtype=torch.float16, enabled=use_amp):
                 mlm_logits, loss, _, _ = model(
                     input_ids=input_ids,
                     organism_ids=organism_ids,
@@ -182,18 +215,26 @@ def main():
                     dg_weight=args.dg_weight
                 )
             
+            # scale loss by accum_steps
+            loss = loss / args.accum_steps
             if use_amp:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
+            total_train_loss += loss.item() * args.accum_steps
+
+            # step optimizer after accumulation
+            if (i + 1) % args.accum_steps == 0:
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
 
             if torch.isnan(loss):
                 print(f"NaN loss detected at step {i}. Stopping training.")
@@ -202,9 +243,21 @@ def main():
 
             if (i + 1) % 100 == 0:
                 progress_bar.set_postfix({
-                    'train_loss': total_train_loss / (i + 1),
-                    'grad_norm': grad_norm.item()
+                    'train_loss': total_train_loss / (i + 1)
                 })
+
+        # handle remaining gradients if not divisible
+        if args.accum_steps > 1 and len(train_loader) % args.accum_steps != 0:
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
 
         model.eval()
         total_val_loss = 0
@@ -218,8 +271,7 @@ def main():
         with torch.no_grad():
             for batch in val_loader:
                 input_ids, organism_ids, attention_mask, labels, cai_target, dg_target = [t.to(device) for t in batch]
-                
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                with torch.autocast(device_type=amp_device_type, dtype=torch.float16, enabled=use_amp):
                     mlm_logits, _, cai_pred, dg_pred = model(input_ids, organism_ids=organism_ids, attention_mask=attention_mask)
 
                 masked_tokens = labels != -100

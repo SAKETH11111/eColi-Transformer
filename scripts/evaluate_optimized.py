@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--input_fasta", type=str, required=True, help="FASTA file of wild-type sequences.")
     parser.add_argument("--output_json", type=str, required=True, help="Output JSON file for the results.")
     parser.add_argument("--model_path", type=str, default="checkpoints/multitask_long.pt", help="Path to the trained model.")
-    parser.add_argument("--cai_csv", type=str, default="data/raw/CAI.csv", help="Path to CAI weights CSV.")
+    parser.add_argument("--cai_csv", type=str, default="data/raw/ecoli_cai_weights.csv", help="Path to CAI weights CSV.")
     parser.add_argument("--beam_size", type=int, default=5, help="Beam size for optimization.")
     args = parser.parse_args()
 

@@ -59,6 +59,13 @@ class CodonTokenizer:
         self.mask_id = MASK_ID
         self.cls_id = CLS_ID
         self.sep_id = SEP_ID
+        self.__post_init_setup()
+
+    def __post_init_setup(self):
+        """Build additional lookup tables and helper mappings used by decoders."""
+        # Mapping codon string -> token ID and reverse (for raw codon tokens only)
+        self.codon_to_id: Dict[str, int] = {codon: self.token_to_id[codon] for codon in CODON_LIST}
+        self.id_to_codon: Dict[int, str] = {idx: tok for idx, tok in self.id_to_token.items() if len(tok) == 3 and all(b in BASES for b in tok)}
 
     def encode(self, tokens: List[str]) -> List[int]:
         """Encodes a list of tokens into their corresponding IDs."""
@@ -121,6 +128,50 @@ class CodonTokenizer:
                     break
                 aa_codon_tokens.append(f"{aa}_{codon}")
         return aa_codon_tokens
+
+    # ------------------------------------------------------------------
+    # Helper methods required by downstream code (legacy decoders, etc.)
+    # ------------------------------------------------------------------
+    def get_codons_for_aa(self, aa: str) -> List[str]:
+        """Return list of synonymous codons for a given amino-acid single-letter code."""
+        return AA_TO_CODONS.get(aa, [])
+
+    def is_stop_codon(self, codon: str) -> bool:
+        """Check whether a codon corresponds to a stop signal."""
+        return CODON_TO_AA.get(codon) == STOP_CODON
+
+    def get_aa_for_codon(self, codon: str) -> str:
+        """Return amino-acid letter for a codon ("*" for stop, '' if invalid)."""
+        return CODON_TO_AA.get(codon, '')
+
+    def encode_cds(self, cds: str, add_special_tokens: bool = True) -> Tuple[List[int], List[str]]:
+        """Encode a DNA coding sequence into token IDs.
+
+        Parameters
+        ----------
+        cds : str
+            Full DNA sequence (will be upper-cased; non-ATGC characters ignored).
+        add_special_tokens : bool
+            Whether to wrap the sequence with [CLS] / [SEP].
+
+        Returns
+        -------
+        Tuple[List[int], List[str]]
+            token_ids: List of vocabulary IDs (including specials if requested)
+            codons:    Original list of codon strings (length == num codons)
+        """
+        cds = cds.upper()
+        codons = [cds[i:i + 3] for i in range(0, len(cds), 3) if len(cds[i:i + 3]) == 3]
+        tokens = codons[:]
+        if add_special_tokens:
+            tokens = ['[CLS]'] + tokens + ['[SEP]']
+        token_ids = self.encode(tokens)
+        return token_ids, codons
+
+    # Maintain backward compatibility with code that expects a `decode` method
+    def decode(self, token_ids: List[int]) -> str:  # noqa: D401
+        """Alias for decode_to_str for legacy interface."""
+        return self.decode_to_str(token_ids)
 
 if __name__ == '__main__':
     tokenizer = CodonTokenizer()
