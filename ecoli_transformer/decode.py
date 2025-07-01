@@ -8,7 +8,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
-from ecoli_transformer.tokenizer import CodonTokenizer, RESTRICTION_SITES
+from ecoli_transformer.tokenizer_v2 import CodingTokenizerV2 as CodonTokenizer, RESTRICTION_SITES
 
 def has_restriction_site(sequence: str, sites: dict = RESTRICTION_SITES) -> bool:
     """Checks if a sequence contains any of the given restriction sites."""
@@ -94,7 +94,7 @@ class BeamSearchDecoder:
                         continue
                     
                     # Enforce protein sequence constraint
-                    codon_str = self.tokenizer.id_to_codon.get(next_token_id)
+                    codon_str = self.tokenizer.id_to_codon_safe(next_token_id)
                     if codon_str:
                         target_aa = aa_per_codon_idx.get(mask_index - 1) # -1 for CLS token
                         if target_aa and codon_str not in self.tokenizer.get_codons_for_aa(target_aa):
@@ -102,8 +102,14 @@ class BeamSearchDecoder:
 
                     # Create the new sequence tokens: replace the mask with the chosen token
                     new_tokens = tokens[:]
-                    new_tokens[mask_index] = next_token_id
-                    
+                    new_tokens[mask_index] = next_token_id  # insert selected token
+
+                    # HOTFIX: Prevent pathological repetition (≥4 identical codons)
+                    if len(new_tokens) >= 4:
+                        last_codons = [self.tokenizer.id_to_codon_safe(tid) for tid in new_tokens[-4:]]
+                        if last_codons[0] != "" and last_codons.count(last_codons[0]) == 4:
+                            continue  # skip candidate with 4-codon homopolymer
+
                     # Calculate new sequence score
                     new_score = score + token_logp
                     if self.lambda_cai > 0:
@@ -131,7 +137,8 @@ class BeamSearchDecoder:
             # Ensure the last codon is a stop codon
             if len(tokens) > 2: # at least CLS, CODON, SEP
                 last_codon_id = tokens[-2]
-                if not self.tokenizer.is_stop_codon(self.tokenizer.id_to_codon.get(last_codon_id, '')):
+                last_codon = self.tokenizer.id_to_codon_safe(last_codon_id)
+                if not self.tokenizer.is_stop_codon(last_codon):
                     tokens[-2] = self.tokenizer.codon_to_id['TAA']
             
             seq_str = self.tokenizer.decode(tokens)
@@ -161,23 +168,30 @@ def generate_optimized(sequence: str, model_path: str, beam_size: int = 5, lambd
     # Tokenizer
     tokenizer = CodonTokenizer()
 
-    # Load model with old vocab size, load weights, then resize
-    # This handles the mismatch between the saved model and the new tokenizer
-    OLD_VOCAB_SIZE = 68 # 4 special + 64 codons
-    model = CodonEncoder(vocab_size=OLD_VOCAB_SIZE)
     try:
         checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
     except FileNotFoundError:
         print(f"Error: Model checkpoint not found at {model_path}")
         return []
+
+    # Determine vocab size from the checkpoint
+    try:
+        vocab_size = checkpoint['model_state_dict']['token_embedding.weight'].shape[0]
+    except KeyError:
+        print("Error: Could not determine vocabulary size from checkpoint.")
+        return []
+
+    # Initialize model with the correct vocab size
+    model = CodonEncoder(vocab_size=vocab_size)
+    
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
     except RuntimeError as e:
-        print(f"Error loading state_dict, likely a vocab size mismatch: {e}")
+        print(f"Error loading state_dict: {e}")
+        # Attempting to load with mismatched keys ignored as a fallback
         print("Attempting to load with mismatched keys ignored...")
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
-    # Resize to new vocab size
-    model.resize_token_embeddings(tokenizer.vocab_size)
     model.to(device)
     
     decoder = BeamSearchDecoder(model, tokenizer, device, lambda_cai=lambda_cai, lambda_dg=lambda_dg)

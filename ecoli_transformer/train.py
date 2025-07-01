@@ -17,7 +17,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
-from ecoli_transformer.tokenizer import CodonTokenizer
+from ecoli_transformer.tokenizer_v2 import CodingTokenizerV2 as CodonTokenizer
 
 PAD_ID = CodonTokenizer().pad_id
 

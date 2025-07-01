@@ -8,7 +8,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from ecoli_transformer.model import CodonEncoder
-from ecoli_transformer.tokenizer import CodonTokenizer, RESTRICTION_SITES
+from ecoli_transformer.tokenizer_v2 import CodingTokenizerV2 as CodonTokenizer, RESTRICTION_SITES
 
 def has_restriction_site(sequence: str, sites: dict = RESTRICTION_SITES) -> bool:
     """Checks if a sequence contains any of the given restriction sites."""

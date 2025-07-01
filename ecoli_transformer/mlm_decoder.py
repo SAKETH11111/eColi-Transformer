@@ -3,7 +3,7 @@ import random
 from typing import List, Tuple
 
 from ecoli_transformer.model import CodonEncoder
-from ecoli_transformer.tokenizer import CodonTokenizer, RESTRICTION_SITES, AA_TO_CODONS
+from ecoli_transformer.tokenizer_v2 import CodingTokenizerV2 as CodonTokenizer, RESTRICTION_SITES, AA_TO_CODONS
 
 def has_restriction_site(sequence: str, sites: dict = RESTRICTION_SITES) -> bool:
     """Checks if a sequence contains any of the given restriction sites."""
